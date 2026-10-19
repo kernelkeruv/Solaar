@@ -3,6 +3,7 @@ import importlib.util
 import pathlib
 import subprocess
 import unittest
+
 from unittest import mock
 
 SOURCE = pathlib.Path(__file__).resolve().parents[1] / "tools" / "fedora-security-report.py"
