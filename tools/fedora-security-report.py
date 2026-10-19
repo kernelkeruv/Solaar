@@ -2,8 +2,10 @@
 """Read-only Fedora/RHEL Solaar posture report. No machine identifiers."""
 import argparse
 import json
+import os
 import shutil
 import subprocess
+
 from pathlib import Path
 
 RULE_NAME = "42-logitech-unify-permissions.rules"
@@ -14,13 +16,12 @@ def run(*args):
     if shutil.which(args[0]) is None:
         return "not installed"
     try:
-        result = subprocess.run(
-            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, timeout=4, check=False
-        )
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=4, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return "unavailable"
     if result.returncode:
+        if args[:2] == ("systemctl", "is-active"):
+            return result.stdout.strip()[:240] or "inactive"
         return "unavailable"
     return " ".join(result.stdout.strip().split())[:240] or "no output"
 
@@ -63,7 +64,9 @@ def report():
         "secure_boot": run("mokutil", "--sb-state"),
         "vendor_udev_rule_present": packaged.is_file(),
         "local_udev_rule_present": override.is_file(),
-        "desktop_session": "Wayland" if "wayland" in (__import__("os").environ.get("XDG_SESSION_TYPE", "").lower()) else "other or unspecified",
+        "desktop_session": "Wayland"
+        if "wayland" in (os.environ.get("XDG_SESSION_TYPE", "").lower())
+        else "other or unspecified",
         "compliance": "NOT ASSESSED. Kernel flag, policy and package state do not prove FIPS 140-3 validation or overall system compliance.",
     }
     result["observations"] = []
