@@ -1,0 +1,53 @@
+name: Fedora 44 installation and security checks
+
+on:
+  push:
+    paths:
+      - 'tools/install-rhel.sh'
+      - 'tools/fedora-security-report.py'
+      - 'tests/test_fedora_security.py'
+      - 'RHEL.md'
+      - '.github/workflows/fedora-security.yml'
+  pull_request:
+    paths:
+      - 'tools/install-rhel.sh'
+      - 'tools/fedora-security-report.py'
+      - 'tests/test_fedora_security.py'
+      - 'RHEL.md'
+      - '.github/workflows/fedora-security.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fedora44:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test interpreter (inside disposable CI container)
+        run: dnf install -y bash python3
+      - name: Check Bash syntax and read-only defaults
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n tools/install-rhel.sh
+          work="$(mktemp -d)"
+          export XDG_DATA_HOME="$work"
+          bash tools/install-rhel.sh --check
+          bash tools/install-rhel.sh --dry-run --install | grep -F 'sudo dnf install solaar solaar-udev'
+          bash tools/install-rhel.sh --dry-run --source | grep -F -- '--no-index'
+          test -z "$(ls -A "$work")"
+          if bash tools/install-rhel.sh --install --source --dry-run; then
+            echo "Expected rejection of contradictory install modes" >&2
+            exit 1
+          fi
+      - name: Security report and offline unit tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 -m py_compile tools/fedora-security-report.py
+          python3 -m unittest discover -s tests -p 'test_fedora_security.py' -v
+          python3 tools/fedora-security-report.py --json | python3 -m json.tool >/dev/null

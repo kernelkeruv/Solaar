@@ -1,164 +1,143 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Fedora/RHEL-family Solaar installation helper.
+# Safe default: observation only. Never modifies host security policy.
+set -Eeuo pipefail
 
-SCRIPT_NAME="$(basename "$0")"
-LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/solaar"
-LOG_FILE="$LOG_DIR/rhel-install-$(date +%Y%m%d-%H%M%S).log"
+usage() {
+  cat <<'USAGE'
+Usage: tools/install-rhel.sh [--check | --install | --source] [--dry-run]
+  --check    Read-only environment and package diagnostics (default)
+  --install  Install distro packages using dnf (preferred on Fedora)
+  --source   Install this checkout in an isolated, system-site-packages venv
+  --dry-run  Print mutating commands without executing them
+  --help     Show this help
 
-mkdir -p "$LOG_DIR"
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-say() {
-    printf '\n[%s] %s\n' "$SCRIPT_NAME" "$*"
+--source does not clone, pull, edit shell rc files, or change udev rules.
+Review the repository and use a trusted checkout before running --source.
+USAGE
 }
+mode=check
+dry_run=0
+selected=0
+while (($#)); do
+  case "$1" in
+    --check|--install|--source)
+      ((selected == 0)) || { echo "Choose one mode only" >&2; exit 2; }
+      mode="${1#--}"; selected=1 ;;
+    --dry-run) dry_run=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
 
-warn() {
-    printf '\n[%s] WARNING: %s\n' "$SCRIPT_NAME" "$*"
-}
-
-fail() {
-    printf '\n[%s] ERROR: %s\n' "$SCRIPT_NAME" "$*"
-    exit 1
-}
-
-ask_yes_no() {
-    local prompt="$1"
-    local default="${2:-y}"
-    local answer
-
-    while true; do
-        if [[ "$default" == "y" ]]; then
-            read -r -p "$prompt [Y/n]: " answer || true
-            answer="${answer:-y}"
-        else
-            read -r -p "$prompt [y/N]: " answer || true
-            answer="${answer:-n}"
-        fi
-
-        case "${answer,,}" in
-            y|yes) return 0 ;;
-            n|no) return 1 ;;
-            *) echo "Please answer y or n." ;;
-        esac
-    done
-}
-
-ask_value() {
-    local prompt="$1"
-    local default="$2"
-    local answer
-
-    read -r -p "$prompt [$default]: " answer || true
-    printf '%s\n' "${answer:-$default}"
-}
-
-run_cmd() {
-    say "Running: $*"
+note() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
+run() {
+  if ((dry_run)); then
+    printf 'DRY RUN:'
+    printf ' %q' "$@"
+    printf '\n'
+  else
     "$@"
+  fi
 }
 
-run_sudo() {
-    say "Running with sudo: $*"
-    sudo "$@"
+[[ -r /etc/os-release ]] || { echo "Missing /etc/os-release" >&2; exit 1; }
+# /etc/os-release is supplied by the operating system.
+# shellcheck disable=SC1091
+source /etc/os-release
+os_id="${ID:-unknown}"
+os_family=" ${ID_LIKE:-} "
+case "$os_id" in
+  fedora|rhel|centos|rocky|almalinux|ol) : ;;
+  *) if [[ "$os_family" != *" rhel "* && "$os_family" != *" fedora "* ]]; then
+       if [[ "$mode" != check ]]; then
+         echo "Unsupported distro ($os_id); refusing package changes." >&2
+         exit 1
+       fi
+       warn "Detected $os_id, not a verified Fedora/RHEL family distribution."
+     fi ;;
+esac
+
+if [[ "$mode" == check ]]; then
+  note "Distribution: ${PRETTY_NAME:-$os_id}"
+  note "Solaar executable: $(command -v solaar || printf 'not found')"
+  if command -v rpm >/dev/null 2>&1; then
+    rpm -q solaar solaar-udev || true
+  fi
+  if [[ -f /etc/udev/rules.d/42-logitech-unify-permissions.rules ]]; then
+    warn "Local /etc udev rule exists; inspect for vendor-rule shadowing."
+  elif [[ -f /usr/lib/udev/rules.d/42-logitech-unify-permissions.rules ]]; then
+    note "Packaged udev rule found in /usr/lib/udev/rules.d"
+  else
+    warn "No known Solaar udev rule found."
+  fi
+  if [[ -r /proc/sys/crypto/fips_enabled ]]; then
+    read -r kernel_fips < /proc/sys/crypto/fips_enabled || kernel_fips="unknown"
+    note "Kernel FIPS flag: $kernel_fips (not a compliance attestation)"
+  fi
+  if command -v update-crypto-policies >/dev/null 2>&1; then
+    note "Crypto policy: $(update-crypto-policies --show 2>/dev/null || printf 'unavailable')"
+  fi
+  if command -v getenforce >/dev/null 2>&1; then
+    note "SELinux: $(getenforce 2>/dev/null || printf 'unavailable')"
+  fi
+  note "No changes made. Fedora FIPS mode does not imply CMVP validation."
+  exit 0
+fi
+
+if (( !dry_run )); then
+  need dnf
+  need sudo
+  if (( EUID == 0 )); then
+    echo "Run as an ordinary user; do not invoke this installer as root." >&2
+    exit 1
+  fi
+fi
+
+if [[ "$mode" == install ]]; then
+  note "Installing distribution packages; dnf will request confirmation."
+  run sudo dnf install solaar solaar-udev
+  if ((!dry_run)); then
+    note "Installed package versions:"
+    rpm -q solaar solaar-udev
+  fi
+  exit 0
+fi
+
+# Source/development build. Fedora's Python is externally managed: never pip
+# into the system interpreter and never bypass PEP 668.
+if ((!dry_run)); then need python3; fi
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+[[ -f "$repo/setup.py" && -f "$repo/lib/solaar/version" ]] || {
+  echo "Installer must run from a valid Solaar checkout." >&2; exit 1;
 }
-
-if [[ "${EUID}" -eq 0 ]]; then
-    fail "Do not run as root. Run as your normal user; this script uses sudo when needed."
+venv="${XDG_DATA_HOME:-$HOME/.local/share}/solaar-dev/venv"
+[[ ! -L "$venv" ]] || { echo "Refusing symlinked venv path: $venv" >&2; exit 1; }
+if [[ -e "$venv" && ! -f "$venv/pyvenv.cfg" ]]; then
+  echo "Refusing to overwrite non-venv path: $venv" >&2; exit 1
 fi
 
-say "Log file: $LOG_FILE"
-say "This installer follows RHEL.md for RHEL 10-like systems."
+note "Source checkout: $repo"
+note "Virtual environment: $venv"
+note "Using packaged Python/GTK/DBus dependencies. No PyPI downloads."
+run sudo dnf install python3 python3-pip python3-setuptools python3-wheel \
+  python3-dbus python3-gobject python3-evdev python3-psutil \
+  python3-pyudev python3-pyyaml python3-xlib solaar-udev
 
-if ask_yes_no "Update dnf metadata first?" y; then
-    run_sudo dnf makecache
+if ((!dry_run)); then
+  umask 077
+  mkdir -p -- "$(dirname -- "$venv")"
 fi
-
-if ask_yes_no "Check for Logitech USB receiver with lsusb now?" y; then
-    if lsusb | grep -i logitech; then
-        say "Logitech device detected."
-    else
-        warn "No Logitech USB receiver detected via lsusb right now. You can continue anyway."
-        ask_yes_no "Continue without receiver detection?" y || fail "Aborted by user."
-    fi
+if [[ ! -f "$venv/pyvenv.cfg" ]]; then
+  run python3 -m venv --system-site-packages "$venv"
 fi
-
-BASE_PACKAGES=(python3 python3-pip git libinput evemu)
-DEV_PACKAGES=(python3-devel gcc pkgconf-pkg-config gtk3 python3-gobject)
-
-say "Base packages: ${BASE_PACKAGES[*]}"
-say "Build/runtime packages: ${DEV_PACKAGES[*]}"
-
-if ask_yes_no "Install required packages with dnf?" y; then
-    run_sudo dnf install -y "${BASE_PACKAGES[@]}" "${DEV_PACKAGES[@]}"
+run "$venv/bin/python" -m pip install --no-index --no-deps \
+  --no-build-isolation --editable "$repo"
+if ((!dry_run)); then
+  "$venv/bin/solaar" --version
+  note "Source build entry point: $venv/bin/solaar"
+  note "Does not change packaged /usr/bin/solaar or shell aliases."
 fi
-
-REPO_PARENT_DEFAULT="$HOME/dev-repos"
-REPO_PARENT="$(ask_value "Repository parent directory" "$REPO_PARENT_DEFAULT")"
-REPO_URL_DEFAULT="https://github.com/pwr-Solaar/Solaar.git"
-REPO_URL="$(ask_value "Git URL for Solaar" "$REPO_URL_DEFAULT")"
-REPO_DIR_DEFAULT="$REPO_PARENT/Solaar"
-REPO_DIR="$(ask_value "Local checkout directory" "$REPO_DIR_DEFAULT")"
-
-run_cmd mkdir -p "$REPO_PARENT"
-
-if [[ -d "$REPO_DIR/.git" ]]; then
-    say "Existing git checkout found at $REPO_DIR"
-    if ask_yes_no "Pull latest changes in this repository?" y; then
-        run_cmd git -C "$REPO_DIR" pull --ff-only
-    fi
-else
-    run_cmd git clone "$REPO_URL" "$REPO_DIR"
-fi
-
-say "Installing Solaar into user site-packages"
-if ask_yes_no "Use upgrade mode for pip install?" n; then
-    run_cmd python3 -m pip install --user --upgrade "$REPO_DIR"
-else
-    run_cmd python3 -m pip install --user "$REPO_DIR"
-fi
-
-SOLAAR_BIN="$HOME/.local/bin/solaar"
-if [[ ! -x "$SOLAAR_BIN" ]]; then
-    fail "Expected executable not found: $SOLAAR_BIN"
-fi
-
-say "Installed binary: $SOLAAR_BIN"
-run_cmd "$SOLAAR_BIN" --help >/dev/null
-
-if ask_yes_no "Add alias 'solaar=$SOLAAR_BIN' to ~/.bashrc if missing?" y; then
-    if grep -Fqx "alias solaar=\"$SOLAAR_BIN\"" "$HOME/.bashrc" 2>/dev/null; then
-        say "Alias already exists in ~/.bashrc"
-    else
-        printf '\n# Solaar user-local install\nalias solaar="%s"\n' "$SOLAAR_BIN" >> "$HOME/.bashrc"
-        say "Alias appended to ~/.bashrc"
-    fi
-fi
-
-if ask_yes_no "Run 'solaar show' now for validation?" y; then
-    run_cmd "$SOLAAR_BIN" show || warn "'solaar show' returned a non-zero status."
-fi
-
-if ask_yes_no "Run 'solaar config <device name>' now?" n; then
-    DEVICE_NAME_DEFAULT="M720 Triathlon Multi-Device Mouse"
-    DEVICE_NAME="$(ask_value "Device name" "$DEVICE_NAME_DEFAULT")"
-    run_cmd "$SOLAAR_BIN" config "$DEVICE_NAME" || warn "'solaar config' returned a non-zero status."
-fi
-
-if ask_yes_no "Run libinput debug-events for a specific /dev/input/eventX device?" n; then
-    EVENT_NODE="$(ask_value "Input event node" "/dev/input/eventX")"
-    warn "This is a live monitor and may run until interrupted (Ctrl+C)."
-    run_sudo libinput debug-events --device "$EVENT_NODE"
-fi
-
-if ask_yes_no "Run keyd monitor (/usr/local/bin/keyd) if present?" n; then
-    if [[ -x /usr/local/bin/keyd ]]; then
-        warn "This is a live monitor and may run until interrupted (Ctrl+C)."
-        run_sudo /usr/local/bin/keyd monitor
-    else
-        warn "/usr/local/bin/keyd not found; skipping."
-    fi
-fi
-
-say "Install workflow completed."
-say "To use alias in current shell: source ~/.bashrc"
-say "Evidence log saved at: $LOG_FILE"
