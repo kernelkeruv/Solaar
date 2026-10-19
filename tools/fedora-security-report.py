@@ -67,7 +67,10 @@ def report():
         "desktop_session": "Wayland"
         if "wayland" in (os.environ.get("XDG_SESSION_TYPE", "").lower())
         else "other or unspecified",
-        "compliance": "NOT ASSESSED. Kernel flag, policy and package state do not prove FIPS 140-3 validation or overall system compliance.",
+        "compliance": (
+            "NOT ASSESSED. Kernel flag, policy and package state do not prove "
+            "FIPS 140-3 validation or overall system compliance."
+        ),
     }
     result["observations"] = []
     if override.is_file():
