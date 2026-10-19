@@ -15,7 +15,7 @@ that are otherwise ignored by the Linux input system.
 
 
 [![codecov](https://codecov.io/gh/pwr-Solaar/Solaar/graph/badge.svg?token=D7YWFEWID6)](https://codecov.io/gh/pwr-Solaar/Solaar)
-[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2+-blue.svg)](../LICENSE.txt)
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2+-blue.svg)](LICENSE.txt)
 
 <p align="center">
 <img src="https://pwr-solaar.github.io/Solaar/screenshots/Solaar-main-window-multiple.png" width="54%"/>
@@ -38,6 +38,14 @@ Solaar supports:
 For more information see
     <a href="https://pwr-solaar.github.io/Solaar/index">the main Solaar documentation page.</a> -
 
+
+## Fedora 44 and RHEL-family hardening
+
+For a package-first Fedora installation, a read-only security posture report,
+source-development isolation, SELinux/Wayland considerations, and the limits
+of FIPS compliance claims, see the [Fedora 44 / RHEL installation guide](RHEL.md).
+The included installer defaults to **read-only checks** and never disables
+security controls or overrides system Python packages.
 
 ## Installation Packages
 
