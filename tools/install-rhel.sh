@@ -123,9 +123,9 @@ fi
 note "Source checkout: $repo"
 note "Virtual environment: $venv"
 note "Using packaged Python/GTK/DBus dependencies. No PyPI downloads."
-run sudo dnf install python3 python3-pip python3-setuptools \
+run sudo dnf install python3 python3-pip python3-setuptools python3-wheel \
   python3-dbus python3-gobject python3-evdev python3-psutil \
-  python3-pyudev python3-yaml python3-xlib solaar-udev
+  python3-pyudev python3-pyyaml python3-xlib solaar-udev
 
 if ((!dry_run)); then
   umask 077
