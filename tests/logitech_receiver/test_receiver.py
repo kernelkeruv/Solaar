@@ -312,3 +312,78 @@ def test_extract_device_kind(data, expected_device_kind):
     device_kind = receiver.extract_device_kind(data)
 
     assert str(device_kind) == expected_device_kind
+
+
+def _make_fake_receiver(cached_devices=None):
+    r = mock.Mock(spec=receiver.Receiver)
+    r.handle = 0x12
+    r._devices = dict(cached_devices or {})
+    r.force_unpair_slot = partial(receiver.Receiver.force_unpair_slot, r)
+    return r
+
+
+def test_force_unpair_slot_empty_slot_acknowledged():
+    r = _make_fake_receiver(cached_devices={})
+    r._unpair_device_per_receiver = mock.Mock(return_value=b"\x00")
+
+    assert r.force_unpair_slot(2) is True
+    r._unpair_device_per_receiver.assert_called_once_with(2)
+    assert 2 not in r._devices
+
+
+def test_force_unpair_slot_stale_sentinel_cleared():
+    # "Device not found" state: slot present in cache but value is None.
+    r = _make_fake_receiver(cached_devices={2: None})
+    r._unpair_device_per_receiver = mock.Mock(return_value=b"\x00")
+
+    assert r.force_unpair_slot(2) is True
+    assert 2 not in r._devices
+
+
+def test_force_unpair_slot_active_device_invalidated():
+    dev = mock.Mock()
+    dev.online = True
+    dev.wpid = "40B4"
+    r = _make_fake_receiver(cached_devices={1: dev})
+    r._unpair_device_per_receiver = mock.Mock(return_value=b"\x00")
+
+    assert r.force_unpair_slot(1) is True
+    assert dev.online is False
+    assert dev.wpid is None
+    assert 1 not in r._devices
+
+
+def test_force_unpair_slot_register_write_failed():
+    r = _make_fake_receiver(cached_devices={2: None})
+    r._unpair_device_per_receiver = mock.Mock(return_value=None)
+
+    assert r.force_unpair_slot(2) is False
+    # On failure, cache state is preserved so Solaar's model stays honest.
+    assert r._devices == {2: None}
+
+
+def test_force_unpair_slot_no_handle():
+    r = _make_fake_receiver()
+    r.handle = None
+    r._unpair_device_per_receiver = mock.Mock()
+
+    assert r.force_unpair_slot(2) is False
+    r._unpair_device_per_receiver.assert_not_called()
+
+
+def test_close_keeps_handle_until_paired_devices_closed():
+    """Paired-device cleanup writes go over the receiver's handle, so
+    Receiver.close must close its devices before dropping it."""
+    device_info = DeviceInfo("11")
+    mock_low_level = LowLevelInterfaceFake(responses_unifying)
+    r = receiver.create_receiver(mock_low_level, device_info, lambda x: x)
+    handle_at_device_close = []
+    dev = mock.Mock()
+    dev.close.side_effect = lambda: handle_at_device_close.append(r.handle)
+    r._devices[1] = dev
+
+    r.close()
+
+    assert handle_at_device_close == [fake_hidpp.open_path("11")]
+    assert r.handle is None
+    assert r._devices == {}

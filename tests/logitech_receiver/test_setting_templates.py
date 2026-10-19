@@ -27,9 +27,13 @@ from logitech_receiver import common
 from logitech_receiver import hidpp20
 from logitech_receiver import hidpp20_constants
 from logitech_receiver import settings_templates
+from logitech_receiver import settings_validator
 from logitech_receiver import special_keys
 
 from . import fake_hidpp
+
+# Per-key colors: any 24-bit RGB; matches PerKeyLighting.validator_class._COLOR_RANGE.
+_PERKEY_COLOR_RANGE = settings_validator.Range(min=0, max=0xFFFFFF, byte_count=3, value_type=common.ColorInt)
 
 # TODO action part of DpiSlidingXY, MouseGesturesXY
 
@@ -273,7 +277,7 @@ simple_tests = [
         fake_hidpp.Response("0A", 0x0420, "0A"),
     ),
     Setup(
-        FeatureTest(settings_templates.LEDControl, 0, 1),
+        FeatureTest(settings_templates.LEDControl, False, True),
         fake_hidpp.Response("00", 0x0470),
         fake_hidpp.Response("01", 0x0480, "01"),
     ),
@@ -291,9 +295,29 @@ simple_tests = [
         fake_hidpp.Response("000000000000000101500000", 0x0430, "000000000000000101500000"),
     ),
     Setup(
-        FeatureTest(settings_templates.RGBControl, 0, 1),
+        FeatureTest(settings_templates.RGBControl, False, True),
         fake_hidpp.Response("0000", 0x0450),
-        fake_hidpp.Response("010100", 0x0450, "0101"),
+        fake_hidpp.Response("010304", 0x0450, "010304"),
+        fake_hidpp.Response("00003C012C", 0x0470, "00"),  # GetRgbPowerModeConfig: idle=60s, sleep=300s
+    ),
+    Setup(  # RGBIdleEffect — software-only, no feature requests for read/write
+        # The setting is a HeteroValidator carrying a LEDEffectSetting.
+        # Default (read with empty persister) = Dim 50%.
+        FeatureTest(
+            settings_templates.RGBIdleEffect,
+            hidpp20.LEDEffectSetting(ID=0x80, intensity=50),
+            hidpp20.LEDEffectSetting(ID=0x80, intensity=75),
+            0,
+        ),
+        fake_hidpp.Response("00", 0xFFFF),  # placeholder — no device requests needed
+    ),
+    Setup(  # RGBIdleTimeout — software-only, no feature requests for read/write
+        FeatureTest(settings_templates.RGBIdleTimeout, 60, 300, 0),
+        fake_hidpp.Response("00", 0xFFFF),  # placeholder — no device requests needed
+    ),
+    Setup(  # RGBSleepTimeout — software-only, no feature requests for read/write
+        FeatureTest(settings_templates.RGBSleepTimeout, 300, 600, 0),
+        fake_hidpp.Response("00", 0xFFFF),  # placeholder — no device requests needed
     ),
     Setup(
         FeatureTest(
@@ -638,14 +662,68 @@ key_tests = [
         fake_hidpp.Response("E010", 0x0430, "02E010"),
         fake_hidpp.Response("E018", 0x0430, "02E018"),
     ),
+    Setup(  # HeadsetOnboardEQ: 2 bands, 128Hz/-2dB/Q10 and 256Hz/+3dB/Q10
+        FeatureTest(settings_templates.HeadsetOnboardEQ, {0: -2, 1: 3}, {1: 5}, 2),
+        [-12, 12],
+        fake_hidpp.Response("8000000002", 0x0400),  # GetEQInfos: has_hw_eq, 2 bands
+        fake_hidpp.Response("00020080FE0A0100030A", 0x0410, "00"),  # GetEQParameters
+        fake_hidpp.Response(  # SetEQParameters: write initial values back (slot 0x00)
+            "00",
+            0x0420,
+            "00020080FE0A0100030A"
+            "055AE300"  # mystery bytes (from pcap)
+            "030E00020000000100170002"
+            "007A6B00D69D94008C516B00C82380005DC27F0075"
+            "906B0022B6940002226B00B44080007EA37F00C1C3040044"
+            "0200170002"
+            "00506B00900F95006ED56A00D185800060477F00CA"
+            "906B00229D950052496A00A12E810085EC7E0075C40400AC",
+        ),
+        fake_hidpp.Response(  # SetEQParameters: persist initial values (slot 0x80)
+            "00",
+            0x0420,
+            "80020080FE0A0100030A"
+            "055AE300"
+            "030E00020000000100170002"
+            "007A6B00D69D94008C516B00C82380005DC27F0075"
+            "906B0022B6940002226B00B44080007EA37F00C1C3040044"
+            "0200170002"
+            "00506B00900F95006ED56A00D185800060477F00CA"
+            "906B00229D950052496A00A12E810085EC7E0075C40400AC",
+        ),
+        fake_hidpp.Response(  # SetEQParameters: write updated band 1 gain=5 (slot 0x00)
+            "00",
+            0x0420,
+            "00020080FE0A0100050A"
+            "055AE300"
+            "030E00020000000100170002"
+            "006F6B00F5A894006A466B00EB2380005DC27F0075"
+            "906B0022BC9400AA156B00613B80007CAD7F00C6C30400BF"
+            "0200170002"
+            "00306B00272F9500BAB56A008C85800060477F00CA"
+            "906B0022B1950002226A000E1F8100AB0A7F004FC604001D",
+        ),
+        fake_hidpp.Response(  # SetEQParameters: persist updated values (slot 0x80)
+            "00",
+            0x0420,
+            "80020080FE0A0100050A"
+            "055AE300"
+            "030E00020000000100170002"
+            "006F6B00F5A894006A466B00EB2380005DC27F0075"
+            "906B0022BC9400AA156B00613B80007CAD7F00C6C30400BF"
+            "0200170002"
+            "00306B00272F9500BAB56A008C85800060477F00CA"
+            "906B0022B1950002226A000E1F8100AB0A7F004FC604001D",
+        ),
+    ),
     Setup(
         FeatureTest(settings_templates.PerKeyLighting, {1: -1, 2: -1, 9: -1, 10: -1, 113: -1}, {2: 0xFF0000}, 4, 4, 0, 1),
         {
-            common.NamedInt(1, "A"): special_keys.COLORSPLUS,
-            common.NamedInt(2, "B"): special_keys.COLORSPLUS,
-            common.NamedInt(9, "I"): special_keys.COLORSPLUS,
-            common.NamedInt(10, "J"): special_keys.COLORSPLUS,
-            common.NamedInt(113, "KEY 113"): special_keys.COLORSPLUS,
+            common.NamedInt(1, "A"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(2, "B"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(9, "I"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(10, "J"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(113, "KEY 113"): _PERKEY_COLOR_RANGE,
         },
         fake_hidpp.Response("00000606000000000000000000000000", 0x0400, "0000"),  # first group of keys
         fake_hidpp.Response("00000200000000000000000000000000", 0x0400, "0001"),  # second group of keys
@@ -666,11 +744,11 @@ key_tests = [
             1,
         ),
         {
-            common.NamedInt(1, "A"): special_keys.COLORSPLUS,
-            common.NamedInt(2, "B"): special_keys.COLORSPLUS,
-            common.NamedInt(9, "I"): special_keys.COLORSPLUS,
-            common.NamedInt(10, "J"): special_keys.COLORSPLUS,
-            common.NamedInt(113, "KEY 113"): special_keys.COLORSPLUS,
+            common.NamedInt(1, "A"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(2, "B"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(9, "I"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(10, "J"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(113, "KEY 113"): _PERKEY_COLOR_RANGE,
         },
         fake_hidpp.Response("00000606000000000000000000000000", 0x0400, "0000"),  # first group of keys
         fake_hidpp.Response("00000200000000000000000000000000", 0x0400, "0001"),  # second group of keys
@@ -695,12 +773,12 @@ key_tests = [
             1,
         ),
         {
-            common.NamedInt(1, "A"): special_keys.COLORSPLUS,
-            common.NamedInt(2, "B"): special_keys.COLORSPLUS,
-            common.NamedInt(9, "I"): special_keys.COLORSPLUS,
-            common.NamedInt(10, "J"): special_keys.COLORSPLUS,
-            common.NamedInt(113, "KEY 113"): special_keys.COLORSPLUS,
-            common.NamedInt(114, "KEY 114"): special_keys.COLORSPLUS,
+            common.NamedInt(1, "A"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(2, "B"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(9, "I"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(10, "J"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(113, "KEY 113"): _PERKEY_COLOR_RANGE,
+            common.NamedInt(114, "KEY 114"): _PERKEY_COLOR_RANGE,
         },
         fake_hidpp.Response("00000606000000000000000000000000", 0x0400, "0000"),  # first group of keys
         fake_hidpp.Response("00000600000000000000000000000000", 0x0400, "0001"),  # second group of keys
@@ -853,3 +931,125 @@ def test_check_feature_setting(test, mocker):
     setting = settings_templates.check_feature_setting(device, tst.sclass.name)
 
     assert setting
+
+
+# --- RGBIdleEffect._pre_read legacy bare-int migration ---------------------
+# Solaar versions before the HeteroValidator refactor stored
+# `rgb_idle_effect` as a bare int (0 / 25 / 50 / 75 / 0x0A / 0x0B).
+# On first read after upgrade, RGBIdleEffect._pre_read should map
+# each to the equivalent LEDEffectSetting and write the upgraded form
+# back to the persister so subsequent reads return it directly.
+
+
+def _idle_setting_with_persisted(value):
+    """Build a minimally-scaffolded RGBIdleEffect with `value` already
+    in the persister and `_value` unread. Returns (setting, device).
+    Avoids RGBIdleEffect.build's led_effects probe (which needs a
+    full device fixture); _pre_read is fully exercised regardless.
+    """
+    from solaar import configuration
+
+    class _Dev:
+        pass
+
+    device = _Dev()
+    device.persister = configuration._DeviceEntry()
+    if value is not None:
+        device.persister[settings_templates.RGBIdleEffect.name] = value
+    setting = settings_templates.RGBIdleEffect.__new__(settings_templates.RGBIdleEffect)
+    setting._device = device
+    setting._value = None
+    return setting, device
+
+
+@pytest.mark.parametrize(
+    "legacy, expected_id, expected_attrs",
+    [
+        (0, 0x00, {}),  # Disabled
+        (25, 0x80, {"intensity": 25}),  # Dim 25%
+        (50, 0x80, {"intensity": 50}),  # Dim 50%
+        (75, 0x80, {"intensity": 75}),  # Dim 75%
+        (0x0A, 0x0A, {"period": 3000, "intensity": 100}),  # Breathe
+        (0x0B, 0x0B, {"period": 3000}),  # Ripple
+    ],
+)
+def test_RGBIdleEffect_legacy_int_migration(legacy, expected_id, expected_attrs):
+    setting, device = _idle_setting_with_persisted(legacy)
+
+    setting._pre_read(cached=True)
+
+    assert isinstance(setting._value, hidpp20.LEDEffectSetting)
+    assert int(setting._value.ID) == expected_id
+    for attr, val in expected_attrs.items():
+        assert getattr(setting._value, attr) == val
+    # Persister was rewritten so subsequent reads return the migrated form.
+    persisted = device.persister[setting.name]
+    assert isinstance(persisted, hidpp20.LEDEffectSetting)
+    assert int(persisted.ID) == expected_id
+
+
+def test_RGBIdleEffect_already_migrated_is_unchanged():
+    """A persisted LEDEffectSetting passes through _pre_read untouched —
+    no double-migration on subsequent reads."""
+    pre_migrated = hidpp20.LEDEffectSetting(ID=0x80, intensity=42)
+    setting, _ = _idle_setting_with_persisted(pre_migrated)
+
+    setting._pre_read(cached=True)
+
+    assert setting._value is pre_migrated  # same instance, no rewrap
+
+
+def test_RGBIdleEffect_none_value_passes_through():
+    """Fresh install / nothing in persister: _pre_read leaves _value as
+    None instead of crashing in the migration branch."""
+    setting, _ = _idle_setting_with_persisted(None)
+
+    setting._pre_read(cached=True)
+
+    assert setting._value is None
+
+
+def test_RGBIdleEffect_unrecognized_int_passes_through():
+    """An int outside the legacy mapping (corrupt config, future value)
+    falls through _pre_read without touching _value or the persister."""
+    setting, device = _idle_setting_with_persisted(999)
+
+    setting._pre_read(cached=True)
+
+    assert setting._value == 999
+    assert device.persister[setting.name] == 999
+
+
+def test_HeadsetOnboardEffect_explicit_black_is_honored():
+    """An explicit Static color1 of 0 (black) must survive: 0 is a real
+    choice — it turns the LEDs off — not an absent field to seed white."""
+    effect = settings_templates._HeadsetOnboardEffect(ID=0, color1=0)
+
+    assert int(effect.color1) == 0
+    assert effect.to_bytes()[2:5] == b"\x00\x00\x00"
+
+
+def test_HeadsetOnboardEffect_absent_color_seeds_default():
+    """A genuinely absent field (None) still falls back to the per-effect
+    default — Static with no color1 given is white."""
+    effect = settings_templates._HeadsetOnboardEffect(ID=0)
+
+    assert int(effect.color1) == 0xFFFFFF
+
+
+def test_HeadsetOnboardEffect_from_bytes_black_round_trips():
+    """A black Static frame read off the device round-trips to black
+    rather than being rewritten to the white default."""
+    effect = settings_templates._HeadsetOnboardEffect.from_bytes(bytes(9))
+
+    assert effect.ID == 0
+    assert int(effect.color1) == 0
+
+
+def test_HeadsetOnboardEffect_absent_animated_fields_seed_defaults():
+    """Animated effects with no params given still get sane defaults so
+    the picker never emits a zero-intensity (LEDs-off) frame."""
+    effect = settings_templates._HeadsetOnboardEffect(ID=1)  # Color Cycle
+
+    assert effect.intensity == 100
+    assert effect.period == 5000

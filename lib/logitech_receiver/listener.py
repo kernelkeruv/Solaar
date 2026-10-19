@@ -15,6 +15,7 @@
 ## with this program; if not, write to the Free Software Foundation, Inc.,
 ## 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+import dataclasses
 import logging
 import queue
 import threading
@@ -52,6 +53,11 @@ class _ThreadedHandle:
         else:
             # if logger.isEnabledFor(logging.DEBUG):
             #     logger.debug("%r opened new handle %d", self, handle)
+            # If original handle was centurion, copy state to new per-thread handle
+            for h in self._handles:
+                if h in base._centurion_handles:
+                    base._centurion_handles[handle] = dataclasses.replace(base._centurion_handles[h])
+                    break
             self._local.handle = handle
             self._handles.append(handle)
             return handle
@@ -90,6 +96,8 @@ class _ThreadedHandle:
     def __str__(self):
         if self._local:
             return str(int(self))
+        else:
+            return "None"
 
     def __repr__(self):
         return f"<_ThreadedHandle({self.path})>"
@@ -145,7 +153,8 @@ class EventsListener(threading.Thread):
                     self.receiver.close()
                     break
                 if n:
-                    n = base.make_notification(*n)
+                    report_id, devnumber, data = n
+                    n = base.make_notification(report_id, devnumber, data)
             else:
                 n = self._queued_notifications.get()  # deliver any queued notifications
             if n:

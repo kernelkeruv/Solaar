@@ -213,7 +213,7 @@ _D(
 _D("Wireless Keyboard K520", codename="K520", protocol=1.0, wpid="2011", registers=(Reg.BATTERY_STATUS,))
 _D("Wireless Solar Keyboard K750", codename="K750", protocol=2.0, wpid="4002")
 _D("Wireless Keyboard K270 (unifying)", codename="K270", protocol=2.0, wpid="4003")
-_D("Wireless Keyboard K360", codename="K360", protocol=2.0, wpid="4004")
+# incorrect _D("Wireless Keyboard K360", codename="K360", protocol=2.0, wpid="4004")
 _D("Wireless Keyboard K230", codename="K230", protocol=2.0, wpid="400D")
 _D("Wireless Touch Keyboard K400", codename="K400", protocol=2.0, wpid=("400E", "4024"))
 _D("Wireless Keyboard MK270", codename="MK270", protocol=2.0, wpid="4023")
@@ -237,7 +237,7 @@ _D("G213 Prodigy Gaming Keyboard", codename="G213", usbid=0xC336, interface=1)
 _D("G512 RGB Mechanical Gaming Keyboard", codename="G512", usbid=0xC33C, interface=1)
 _D("G815 Mechanical Keyboard", codename="G815", usbid=0xC33F, interface=1)
 _D("diNovo Edge Keyboard", codename="diNovo", protocol=1.0, wpid="C714")
-_D("K845 Mechanical Keyboard", codename="K845", usbid=0xC341, interface=3)
+_D("K845 Mechanical Keyboard", codename="K845", usbid=0xC341, interface=1)
 
 # Mice
 
@@ -428,6 +428,8 @@ _D("G500 Gaming Mouse", codename="G500 Gaming", usbid=0xC068, interface=1, proto
 _D("G500s Gaming Mouse", codename="G500s Gaming", usbid=0xC24E, interface=1, protocol=1.0)
 _D("G502 Proteus Spectrum Optical Mouse", codename="G502 Proteus Spectrum", usbid=0xC332, interface=1)
 _D("Logitech PRO Gaming Keyboard", codename="PRO Gaming Keyboard", usbid=0xC339, interface=1)
+_D("Bluetooth Multi-Device Keyboard K380", codename="Keyboard K380", protocol=4.5, btid=0xB342)
+# K380 HID Report Descriptor cannot be parsed
 
 _D("Logitech MX Revolution Mouse M-RCL 124", codename="M-RCL 124", btid=0xB007, interface=1)
 
@@ -465,3 +467,5 @@ _D(
     kind=DEVICE_KIND.headset,
     usbid=0x0ABA,
 )
+# PRO X 2 LIGHTSPEED Gaming Headset (0x0AF7) — fully probed via Centurion transport, no static descriptor needed
+# G522 LIGHTSPEED Gaming Headset (0x0B18 dongle, 0x0B19 wired) — Centurion 0x50 variant, no static descriptor needed

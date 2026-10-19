@@ -17,6 +17,7 @@
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional
+from unittest import mock
 
 import pytest
 
@@ -60,6 +61,8 @@ class DeviceInfoStub:
     hidpp_long: bool = True
     bus_id: int = 0x0003  # USB
     serial: str = "aa:aa:aa;aa"
+    centurion: bool = False
+    centurion_report_id: int | None = None
 
 
 di_bad_handle = DeviceInfoStub(None, product_id="CCCC")
@@ -70,6 +73,7 @@ di_B530 = DeviceInfoStub("11", product_id="B350", bus_id=0x0005)
 di_C068 = DeviceInfoStub("11", product_id="C06B")
 di_C08A = DeviceInfoStub("11", product_id="C08A")
 di_DDDD = DeviceInfoStub("11", product_id="DDDD")
+di_0AF7 = DeviceInfoStub("11", product_id="0AF7", centurion=True)
 
 
 @pytest.mark.parametrize(
@@ -78,6 +82,7 @@ di_DDDD = DeviceInfoStub("11", product_id="DDDD")
         (di_bad_handle, fake_hidpp.r_empty, None),
         (di_error, fake_hidpp.r_empty, False),
         (di_CCCC, fake_hidpp.r_empty, True),
+        (di_0AF7, fake_hidpp.r_empty, True),
     ],
 )
 def test_create_device(device_info, responses, expected_success):
@@ -93,6 +98,52 @@ def test_create_device(device_info, responses, expected_success):
         assert bool(test_device) == expected_success
 
 
+def test_create_centurion_device():
+    """Test that a centurion device gets hidpp_long forced to True and centurion flag set."""
+    from logitech_receiver import base
+
+    with mock.patch.object(base, "probe_centurion_device_addr", return_value=False):
+        low_level_mock = LowLevelInterfaceFake(fake_hidpp.r_empty)
+        test_device = device.create_device(low_level_mock, di_0AF7)
+
+    assert test_device is not None
+    assert test_device.centurion is True
+    assert test_device.hidpp_long is True
+    assert int(test_device.handle) in base._centurion_handles
+    state = base._centurion_handles[int(test_device.handle)]
+    assert state.report_id == base.CENTURION_REPORT_ID  # 0x51 default
+
+    # kind is seeded at construction, so the headset icon shows even offline
+    test_device.online = False
+    assert test_device.kind == "headset"
+
+    # Clean up
+    base._centurion_handles.pop(int(test_device.handle), None)
+
+
+di_0B18 = DeviceInfoStub("11", product_id="0B18", centurion=True, centurion_report_id=0x50)
+
+
+def test_create_centurion_0x50_device():
+    """Test that a 0x50 centurion device gets the correct report ID registered."""
+    from logitech_receiver import base
+
+    with mock.patch.object(base, "probe_centurion_device_addr", return_value=False):
+        low_level_mock = LowLevelInterfaceFake(fake_hidpp.r_empty)
+        test_device = device.create_device(low_level_mock, di_0B18)
+
+    assert test_device is not None
+    assert test_device.centurion is True
+    assert test_device.hidpp_long is True
+    assert int(test_device.handle) in base._centurion_handles
+    state = base._centurion_handles[int(test_device.handle)]
+    assert state.report_id == base.CENTURION_ADDRESSED_REPORT_ID  # 0x50
+    assert state.device_addr is None  # not yet learned
+
+    # Clean up
+    base._centurion_handles.pop(int(test_device.handle), None)
+
+
 @pytest.mark.parametrize(
     "device_info, responses, expected_codename, expected_name, expected_kind",
     [(di_CCCC, fake_hidpp.r_empty, "?? (CCCC)", "Unknown device CCCC", "?")],
@@ -105,6 +156,23 @@ def test_device_name(device_info, responses, expected_codename, expected_name, e
     assert test_device.codename == expected_codename
     assert test_device.name == expected_name
     assert test_device.kind == expected_kind
+
+
+def test_codename_uses_full_name():
+    """A direct-connected HID++ 2.0 device with no friendly name uses its full
+    live name as the codename instead of truncating it at the first space."""
+    test_device = device.create_device(LowLevelInterfaceFake(fake_hidpp.r_empty), di_CCCC)
+    test_device._protocol = 2.0
+    test_device.online = True
+
+    test_device._codename = None
+    test_device._name = "G502 X PLUS"
+    assert test_device.codename == "G502 X PLUS"
+
+    # a leading "Logitech" is still dropped
+    test_device._codename = None
+    test_device._name = "Logitech MX Master 3"
+    assert test_device.codename == "MX Master 3"
 
 
 @pytest.mark.parametrize(
@@ -355,3 +423,20 @@ def test_device_battery(device_info, responses, protocol, expected_battery, chan
     assert test_device.battery() == expected_battery
     test_device.read_battery()
     spy_changed.assert_called_with(**changed)
+
+
+def test_close_runs_cleanups_once():
+    """close() is idempotent: __del__ calls it again at interpreter shutdown,
+    and cleanups must not run a second time (a settings build there fails)."""
+    handle = 0x1
+    test_device = device.Device(
+        LowLevelInterfaceFake(fake_hidpp.r_empty), None, None, None, handle=handle, device_info=di_CCCC
+    )
+    calls = []
+    test_device.cleanups = [lambda d: calls.append(d)]
+
+    test_device.close()
+    test_device.close()  # simulates the __del__ re-entry
+    test_device.__del__()
+
+    assert calls == [test_device]

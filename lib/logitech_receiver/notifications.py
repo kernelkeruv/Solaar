@@ -34,6 +34,7 @@ from . import diversion
 from . import hidpp10
 from . import hidpp10_constants
 from . import hidpp20
+from . import rgb_power
 from . import settings_templates
 from .common import Alert
 from .common import BatteryStatus
@@ -287,6 +288,9 @@ def _process_feature_notification(device: Device, notification: HIDPPNotificatio
         else:
             logger.warning("%s: unknown ADC MEASUREMENT %s", device, notification)
 
+    elif feature == SupportedFeature.CENTURION_BATTERY_SOC:
+        device.set_battery_info(hidpp20.decipher_battery_centurion(notification.data)[1])
+
     elif feature == SupportedFeature.SOLAR_DASHBOARD:
         if notification.data[5:9] == b"GOOD":
             charge, lux, adc = struct.unpack("!BHH", notification.data[:5])
@@ -319,9 +323,14 @@ def _process_feature_notification(device: Device, notification: HIDPPNotificatio
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("wireless status: %s", notification)
             reason = "powered on" if notification.data[2] == 1 else None
-            if notification.data[1] == 1:  # device is asking for software reconfiguration so need to change status
+            if notification.data[1] == 1:  # device is asking for software reconfiguration
                 alert = Alert.NONE
-                device.changed(active=True, alert=alert, reason=reason, push=True)
+                device.changed(active=True, alert=alert, reason=reason)
+                # changed(active=True) already runs apply_settings_if_needed on
+                # the first transition; for follow-up reconfig notifications
+                # on an already-active device, fire the gate here so the
+                # cookie comparison decides whether to re-push.
+                device.apply_settings_if_needed()
         else:
             logger.warning("%s: unknown WIRELESS %s", device, notification)
 
@@ -418,6 +427,55 @@ def _process_feature_notification(device: Device, notification: HIDPPNotificatio
                 if brightness:
                     brightness = struct.unpack("!H", device.feature_request(SupportedFeature.BRIGHTNESS_CONTROL, 0x10)[:2])[0]
                 device.setting_callback(device, settings_templates.BrightnessControl, [brightness])
+
+    elif feature == SupportedFeature.RGB_EFFECTS:
+        fn = notification.address >> 4
+        if fn == 1:  # onUserActivity: type=0 is IDLE, type!=0 is ACTIVE
+            activity_type = notification.data[0] if notification.data else 0xFF
+            rgb_power.on_user_activity(device, activity_type)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s: RGB_EFFECTS notification addr=%02x: %s", device, notification.address, notification)
+
+    elif feature == SupportedFeature.HEADSET_ADVANCED_PARA_EQ:
+        # G522 emits change events with the same payload shape as the
+        # corresponding setter request:
+        #   fn 0 — band change       (3-byte header [dir, slot, pad] + bands)
+        #   fn 2 — friendly-name change (header + nameLen + name)
+        #   fn 3 — UUID change          (header + 16-byte UUID)
+        # Low nibble of `address` is the swid the firmware echoes back —
+        # match on the function index only.
+        fn = notification.address >> 4
+        if fn == 0:
+            info = getattr(device, "_advanced_eq_info", None)
+            payload = notification.data[3:] if notification.data else b""
+            if info and len(payload) >= 5:
+                bands = hidpp20.parse_v2_bands(b"\x00" + payload, info)
+                if bands and device.setting_callback:
+                    band_map = {i: int(round(g)) for i, (_t, _f, g) in enumerate(bands)}
+                    device.setting_callback(device, settings_templates.HeadsetAdvancedEQ, [band_map])
+            elif logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "%s: HEADSET_ADVANCED_PARA_EQ band-change event with no parseable payload %s", device, notification
+                )
+        elif fn in (2, 3) and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s: HEADSET_ADVANCED_PARA_EQ fn=%d change event %s", device, fn, notification)
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s: unknown HEADSET_ADVANCED_PARA_EQ %s", device, notification)
+
+    elif feature == SupportedFeature.HEADSET_MIC_MUTE:
+        # G522 emits state-change events on two function indices, both carrying
+        # the new state in data[0] (0 = unmuted, 1 = muted):
+        #   fn 0 — physical mute switch press
+        #   fn 1 — echo following a host-driven SetState (fn 2) write
+        # Low nibble of `address` is the swid the firmware echoes back, which
+        # varies with the request — match on the function index only.
+        fn = notification.address >> 4
+        if fn in (0, 1) and notification.data:
+            muted = bool(notification.data[0])
+            if device.setting_callback:
+                device.setting_callback(device, settings_templates.HeadsetMicMute, [muted])
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s: unknown HEADSET_MIC_MUTE %s", device, notification)
 
     diversion.process_notification(device, notification, feature)
     return True

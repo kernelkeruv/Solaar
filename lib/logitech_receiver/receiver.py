@@ -171,6 +171,8 @@ class Receiver:
         self.pairing = Pairing()
         self.initialize(product_info)
         hidpp10.set_configuration_pending_flags(self, 0xFF)
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("%s: init receiver: handle %s, path %s, serial %s", self, self.handle, self.path, self.serial)
 
     def initialize(self, product_info: dict):
         # read the receiver information subregister, so we can find out max_devices
@@ -185,11 +187,14 @@ class Receiver:
             self.max_devices = product_info.get("max_devices", 1)
 
     def close(self):
-        handle, self.handle = self.handle, None
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("%s: closing - handle %s %s", self, type(self.handle), self.handle)
+        # Close paired devices first: their cleanup writes go over this receiver's handle.
         for _n, d in self._devices.items():
             if d:
                 d.close()
         self._devices.clear()
+        handle, self.handle = self.handle, None
         return handle and self.low_level.close(handle)
 
     def __del__(self):
@@ -413,6 +418,31 @@ class Receiver:
         """Receiver specific unpairing."""
         return self.write_register(Registers.RECEIVER_PAIRING, 0x03, key)
 
+    def force_unpair_slot(self, slot: int) -> bool:
+        """Force-unpair a slot by writing the unpair register, ignoring cache state.
+
+        Intended for clearing stale pairings on receivers (Lightspeed in particular)
+        where Solaar cannot read pairing info for a slot. Bypasses the ``may_unpair``
+        and ``re_pairs`` gates that ``_unpair_device`` applies. Returns True if the
+        register write was acknowledged by the receiver.
+        """
+        if not self.handle:
+            return False
+        slot = int(slot)
+        reply = self._unpair_device_per_receiver(slot)
+        if reply:
+            cached = self._devices.get(slot)
+            if cached:
+                cached.online = False
+                cached.wpid = None
+            if slot in self._devices:
+                del self._devices[slot]
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("%s force-unpaired slot %d", self, slot)
+            return True
+        logger.warning("%s failed to force-unpair slot %d", self, slot)
+        return False
+
     def __len__(self):
         return len([d for d in self._devices.values() if d is not None])
 
@@ -574,9 +604,10 @@ receiver_class_mapping = {
 
 def create_receiver(low_level: LowLevelInterface, device_info, setting_callback=None) -> Optional[Receiver]:
     """Opens a Logitech Receiver found attached to the machine, by Linux device path."""
-
     try:
         handle = low_level.open_path(device_info.path)
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("create receiver %s %s", handle, device_info)
         if handle:
             usb_id = device_info.product_id
             if isinstance(usb_id, str):

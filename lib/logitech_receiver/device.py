@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import struct
 import threading
 import time
 import typing
@@ -29,6 +30,7 @@ from typing import Protocol
 
 from solaar import configuration
 
+from . import base
 from . import descriptors
 from . import exceptions
 from . import hidpp10
@@ -38,6 +40,8 @@ from . import settings
 from . import settings_templates
 from .common import Alert
 from .common import Battery
+from .common import BatteryStatus
+from .common import _read_usb_product_string
 from .hidpp10_constants import NotificationFlag
 from .hidpp20_constants import SupportedFeature
 
@@ -74,6 +78,11 @@ def create_device(low_level: LowLevelInterface, device_info, setting_callback=No
     try:
         handle = low_level.open_path(device_info.path)
         if handle:
+            if getattr(device_info, "centurion", False):
+                report_id = getattr(device_info, "centurion_report_id", None) or base.CENTURION_REPORT_ID
+                state = base.CenturionHandleState(report_id=report_id)
+                base._centurion_handles[int(handle)] = state
+                base.probe_centurion_device_addr(handle, state)
             # a direct connected device might not be online (as reported by user)
             return Device(
                 low_level,
@@ -124,12 +133,24 @@ class Device:
         self.product_id = device_info.product_id if device_info else None
         self.hidpp_short = device_info.hidpp_short if device_info else None
         self.hidpp_long = device_info.hidpp_long if device_info else None
+        self.centurion = device_info.centurion if device_info else False
+        self._centurion_usb_name = None
+        if self.centurion:
+            self.hidpp_long = True  # Centurion devices always use long HID++ messages
+            # Read USB product string for device name — avoids slow bridge probe via CENTURION_DEVICE_NAME.
+            # device_info.product is often None (udev reads USB interface attrs, not device attrs),
+            # so fall back to reading from sysfs.
+            self._centurion_usb_name = getattr(device_info, "product", None) if device_info else None
+            if not self._centurion_usb_name and self.path:
+                self._centurion_usb_name = _read_usb_product_string(self.path)
         self.bluetooth = device_info.bus_id == 0x0005 if device_info else False  # Bluetooth needs long messages
         self.hid_serial = device_info.serial if device_info else None
         self.setting_callback = setting_callback  # for changes to settings
         self.status_callback = None  # for changes to other potentially visible aspects
         self.wpid = pairing_info["wpid"] if pairing_info else None  # the Wireless PID is unique per device model
         self._kind = pairing_info["kind"] if pairing_info else None  # mouse, keyboard, etc (see hidpp10.DEVICE_KIND)
+        if self._kind is None and self.centurion:
+            self._kind = hidpp10_constants.DEVICE_KIND.headset  # every Centurion-transport device so far is a headset
         self._serial = pairing_info["serial"] if pairing_info else None  # serial number (an 8-char hex string)
         self._polling_rate = pairing_info["polling"] if pairing_info else None
         self._power_switch = pairing_info["power_switch"] if pairing_info else None
@@ -141,6 +162,7 @@ class Device:
         self._tid_map = None  # map from transports to product identifiers
         self._persister = None  # persister holds settings
         self._led_effects = self._firmware = self._keys = self._remap_keys = self._gestures = self._force_buttons = None
+        self._keyboard_layout = None  # lazy: country code from HID++ 0x4540, None if unsupported
         self._profiles = self._backlight = self._settings = None
         self.registers = []
         self.notification_flags = None
@@ -150,9 +172,11 @@ class Device:
         self.present = True  # used for devices that are integral with their receiver but that separately be disconnected
 
         self._feature_settings_checked = False
+        self._closed = False
         self._gestures_lock = threading.Lock()
         self._settings_lock = threading.Lock()
         self._persister_lock = threading.Lock()
+        self._simple_lock = threading.Lock()
         self._notification_handlers = {}  # See `add_notification_handler`
         self.cleanups = []  # functions to run on the device when it is closed
 
@@ -203,8 +227,10 @@ class Device:
             self._protocol = self.descriptor.protocol if self.descriptor.protocol else None
             self.registers = self.descriptor.registers if self.descriptor.registers else []
 
-        if self._protocol is not None:
-            self.features = None if self._protocol < 2.0 else hidpp20.FeaturesArray(self)
+        # Centurion devices always use HID++ 2.0 features regardless of the
+        # protocol version the dongle reports (e.g. G522 reports 1.1).
+        if self._protocol is not None and not self.centurion:
+            self.features = {} if self._protocol < 2.0 else hidpp20.FeaturesArray(self)
         else:
             self.features = hidpp20.FeaturesArray(self)  # may be a 2.0 device; if not, it will fix itself later
 
@@ -223,15 +249,29 @@ class Device:
                 self.ping()
             except exceptions.NoSuchDevice:
                 logger.warning("device %s inaccessible - no protocol set", self)
-        return self._protocol or 0
+        result = self._protocol or 0
+        # Centurion devices always use HID++ 2.0 features regardless of the
+        # protocol version the dongle reports (e.g. G522 reports 1.1).
+        # Ensure all `protocol < 2.0` gates route through the 2.0 code path.
+        if self.centurion and result < 2.0:
+            return 2.0
+        return result
 
     @property
     def codename(self):
         if not self._codename:
             if self.online and self.protocol >= 2.0:
-                self._codename = _hidpp20.get_friendly_name(self)
-                if not self._codename:
-                    self._codename = self.name.split(" ", 1)[0] if self.name else None
+                if not self.centurion:
+                    self._codename = _hidpp20.get_friendly_name(self)
+                if not self._codename and self.name:
+                    # Use the full live name; only drop a leading "Logitech".
+                    # Truncating at the first space mangled good names like
+                    # "G502 X PLUS" (direct USB connection, no friendly name).
+                    names = self.name.split(" ")
+                    if not self.centurion and len(names) > 1 and names[0] == "Logitech":
+                        self._codename = " ".join(names[1:])
+                    else:
+                        self._codename = self.name
             if not self._codename and self.receiver:
                 codename = self.receiver.device_codename(self.number)
                 if codename:
@@ -243,16 +283,44 @@ class Device:
     @property
     def name(self):
         if not self._name:
-            if self.online and self.protocol >= 2.0:
-                self._name = _hidpp20.get_name(self)
+            with self._simple_lock:
+                if self._name is None:
+                    if self.online and self.centurion:
+                        self._name = _hidpp20.get_name_centurion(self) or getattr(self, "_centurion_usb_name", None)
+                        if not self._name:
+                            self._name = f"Unknown device {self.wpid or self.product_id}"
+                    elif self.online and self.protocol >= 2.0:
+                        self._name = _hidpp20.get_name(self)
         return self._name or self._codename or f"Unknown device {self.wpid or self.product_id}"
 
     def get_ids(self):
+        if self.centurion:
+            self._get_ids_centurion()
+            return
         ids = _hidpp20.get_ids(self)
         if ids:
             self._unitId, self._modelId, self._tid_map = ids
             if logger.isEnabledFor(logging.INFO) and self._serial and self._serial != self._unitId:
                 logger.info("%s: unitId %s does not match serial %s", self, self._unitId, self._serial)
+
+    def _get_ids_centurion(self):
+        if getattr(self, "_centurion_ids_done", False):
+            return
+        self._centurion_ids_done = True
+        serial = _hidpp20.get_serial_centurion(self)
+        if not serial or not serial.strip() or not serial.strip().isprintable():
+            serial = _hidpp20.get_serial_centurion_sub(self)
+        if serial and serial.strip() and serial.strip().isprintable():
+            self._serial = serial.strip()
+            self._unitId = self._serial
+        hw_info = _hidpp20.get_hardware_info_centurion(self)
+        if hw_info:
+            model_id, hw_revision, product_id = hw_info
+            # modelId is the stable per-model disambiguator (G522 0x32, G325
+            # 0x44). productId is shared across the headset family and varies
+            # by firmware (G522 0x0508 -> 0x0509), so it must NOT key modelId.
+            self._modelId = f"{model_id:02X}"
+            self._tid_map = {"usbid": f"{product_id:04X}"}
 
     @property
     def unitId(self):
@@ -274,6 +342,8 @@ class Device:
 
     @property
     def kind(self):
+        # Centurion devices are seeded with kind=headset at construction, so
+        # this online lookup only runs for descriptor-less HID++ 2.0 devices.
         if not self._kind and self.online and self.protocol >= 2.0:
             self._kind = _hidpp20.get_kind(self)
         return self._kind or "?"
@@ -281,7 +351,9 @@ class Device:
     @property
     def firmware(self) -> tuple[common.FirmwareInfo]:
         if self._firmware is None and self.online:
-            if self.protocol >= 2.0:
+            if self.centurion:
+                self._firmware = _hidpp20.get_firmware_centurion_sub(self) or _hidpp20.get_firmware_centurion(self)
+            elif self.protocol >= 2.0:
                 self._firmware = _hidpp20.get_firmware(self)
             else:
                 self._firmware = _hidpp10.get_firmware(self)
@@ -289,6 +361,8 @@ class Device:
 
     @property
     def serial(self):
+        if not self._serial and self.online and self.centurion:
+            self.get_ids()
         return self._serial or ""
 
     @property
@@ -305,6 +379,13 @@ class Device:
             rate = _hidpp20.get_polling_rate(self)
             self._polling_rate = rate if rate else self._polling_rate
         return self._polling_rate
+
+    @property
+    def keyboard_layout(self):
+        if self._keyboard_layout is None and self.online and self.protocol >= 2.0:
+            if SupportedFeature.KEYBOARD_LAYOUT_2 in self.features:
+                self._keyboard_layout = _hidpp20.get_keyboard_layout(self)
+        return self._keyboard_layout
 
     @property
     def led_effects(self):
@@ -362,6 +443,65 @@ class Device:
         if self.online and self.protocol >= 2.0:
             _hidpp20.config_change(self, configuration_, no_reply=no_reply)
 
+    def signal_configuration_complete(self, cookie=None):
+        """SetComplete on ConfigChange to ack end of configuration.
+
+        With no cookie, sends the host's session counter (see
+        Hidpp20.set_configuration_complete)."""
+        if self.online and self.protocol >= 2.0:
+            _hidpp20.set_configuration_complete(self, cookie=cookie)
+
+    def _record_config_cookie(self):
+        """After a successful apply, SetComplete with the next session cookie
+        and persist it so the dedup gate in apply_settings_if_needed can
+        detect drift on follow-up reconfig notifications within this session."""
+        if self.protocol < 2.0:
+            return
+        if not (self.features and SupportedFeature.CONFIG_CHANGE in self.features):
+            return
+        cookie = _hidpp20.next_session_cookie()
+        self.signal_configuration_complete(cookie=cookie)
+        if self.persister is not None:
+            self.persister["_config_cookie"] = [cookie[0], cookie[1]]
+
+    def apply_settings_if_needed(self):
+        """Cookie-gated dedup helper for repeat WIRELESS_DEVICE_STATUS
+        reconfig notifications on an already-active device. Skips when the
+        live ConfigChange cookie matches the value stored by the most
+        recent apply, otherwise applies and re-records. Must NOT be used as
+        the initial-activation apply path — across power cycles, devices
+        whose firmware resets the cookie to a fixed value would falsely
+        match a stored cookie from a prior session and skip the apply the
+        device actually needs.
+        Returns True if apply ran, False if it was skipped."""
+        if not self.online:
+            return False
+        if self.protocol >= 2.0 and self.features and SupportedFeature.CONFIG_CHANGE in self.features:
+            live = _hidpp20.get_configuration_cookie(self)
+            if live and len(live) >= 2:
+                stored = self.persister.get("_config_cookie") if self.persister else None
+                live_pair = [live[0], live[1]]
+                if stored == live_pair:
+                    if logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            "%s: config cookie %02X%02X matches stored — skip apply_all_settings",
+                            self,
+                            live[0],
+                            live[1],
+                        )
+                    return False
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(
+                        "%s: config cookie live=%02X%02X stored=%s — apply_all_settings",
+                        self,
+                        live[0],
+                        live[1],
+                        "%02X%02X" % (stored[0], stored[1]) if stored else "None",
+                    )
+        settings.apply_all_settings(self)
+        self._record_config_cookie()
+        return True
+
     def reset(self, no_reply=False):
         self.set_configuration(0, no_reply)
 
@@ -398,6 +538,15 @@ class Device:
 
     def battery(self):  # None  or  level, next, status, voltage
         if self.protocol < 2.0:
+            if self.centurion:
+                logger.debug(
+                    "%s: battery() dispatching HID++ 1.0 path for a Centurion device "
+                    "(protocol=%s, _protocol=%s) — device_addr probe likely failed, "
+                    "expect INVALID_SUB_ID_COMMAND",
+                    self,
+                    self.protocol,
+                    self._protocol,
+                )
             return _hidpp10.get_battery(self)
         else:
             battery_feature = self.persister.get("_battery", None) if self.persister else None
@@ -461,15 +610,28 @@ class Device:
                 ):
                     if logger.isEnabledFor(logging.INFO):
                         logger.info("%s pushing device settings %s", self, self.settings)
+                    # Activation apply must be unconditional — across power
+                    # cycles, the device may have lost state while its cookie
+                    # reset to a value that happens to match what we stored
+                    # last session. Cookie comparison is only a valid dedup
+                    # signal for repeat reconfig notifications within an
+                    # already-active session (see apply_settings_if_needed).
                     settings.apply_all_settings(self)
+                    self._record_config_cookie()
                 if not was_active:
                     if self.protocol < 2.0:  # Make sure to set notification flags on the device
                         self.notification_flags = self.enable_connection_notifications()
-                    else:
-                        self.set_configuration(0x11)  # signal end of configuration
                     self.read_battery()  # battery information may have changed so try to read it now
-            elif was_active and self.receiver:  # need to set configuration pending flag in receiver
+            elif was_active and self.receiver and not isinstance(self.receiver, CenturionReceiver):
                 hidpp10.set_configuration_pending_flags(self.receiver, 0xFF)
+            if not active and self.receiver and self.battery_info is not None and self.battery_info.level is not None:
+                self.battery_info = Battery(
+                    self.battery_info.level,
+                    self.battery_info.next_level,
+                    BatteryStatus.OFFLINE,
+                    self.battery_info.voltage,
+                    self.battery_info.light_level,
+                )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("device %d changed: active=%s %s", self.number, self._active, self.battery_info)
         if self.status_callback is not None:
@@ -533,23 +695,330 @@ class Device:
             long = self.hidpp_long is True or (
                 self.hidpp_long is None and (self.bluetooth or self._protocol is not None and self._protocol >= 2.0)
             )
+            # Centurion child: CPL framing strips devnumber and responses always
+            # have devnumber=0xFF, so we must send 0xFF to match responses.
+            devnumber = 0xFF if (self.centurion and self.receiver and not self.handle) else self.number
             return self.low_level.request(
                 self.handle or (self.receiver.handle if self.receiver else None),
-                self.number,
+                devnumber,
                 request_id,
                 *params,
                 no_reply=no_reply,
                 long_message=long,
                 protocol=self.protocol,
             )
+        if logger.isEnabledFor(logging.WARN):
+            logger.warning(
+                "%s: request failure for device %s %s %s",
+                self,
+                self.handle,
+                self.receiver,
+                self.receiver._devices if self.receiver else None,
+            )
 
     def feature_request(self, feature, function=0x00, *params, no_reply=False):
         if self.protocol >= 2.0:
+            if self.centurion:
+                # Ensure sub-device features are discovered before routing decision
+                if self.features is not None:
+                    self.features._check()
+                # Guard against Centurion/HID++ 2.0 feature ID collisions. IntEnum
+                # members with the same int value hash equal, so a dict lookup for
+                # SupportedFeature.DEVICE_NAME (0x0005) succeeds even when the
+                # device actually has CenturionCoreFeature.MULTI_HOST_CONTROL at
+                # that slot. If the type of the stored enum differs from what the
+                # caller asked for, treat the feature as unsupported.
+                if self.features is not None:
+                    idx = self.features.get(feature)
+                    if idx is not None:
+                        stored = self.features.inverse.get(idx)
+                        if stored is not None and type(stored) is not type(feature):
+                            return None
+                if feature in getattr(self, "_centurion_sub_features", ()):
+                    sub_idx = self.features.get(feature)
+                    if sub_idx is not None:
+                        return self.centurion_bridge_request(sub_idx, function, *params, no_reply=no_reply)
             return hidpp20.feature_request(self, feature, function, *params, no_reply=no_reply)
+        if logger.isEnabledFor(logging.WARN):
+            logger.warning("%s: feature request failure for device with protocol %s", self, self.protocol)
+
+    # Max sub-message bytes in the first bridge fragment (for 0x51):
+    # 64 - 1 (report ID) - 1 (cpl_len) - 1 (flags) - 2 (bridge prefix) - 2 (bridge hdr) = 57;
+    # one byte of conservative margin gives 56. For 0x50 the device_addr byte
+    # eats one more, so first_chunk = 55 (handled dynamically below).
+    _BRIDGE_FIRST_CHUNK = 56
+    # Continuation fragments carry raw sub_msg data (no bridge prefix/hdr):
+    # 64 - 1 (report ID) - 1 (cpl_len) - 1 (flags) = 61; one byte of margin
+    # gives 60.
+    _BRIDGE_CONT_CHUNK = 60
+
+    def centurion_bridge_request(self, sub_feat_idx, sub_function=0x00, *params, no_reply=False):
+        """Send a request to a Centurion sub-device via CentPPBridge.
+
+        Builds the 4-layer nested message:
+        Layer 1: [report_id]  (0x51 or 0x50)
+        Layer 2: [device_addr (0x50 only),] cpl_length, flags
+        Layer 3: [bridge_idx, sendFragment_func|swid, bridge_hdr...]
+        Layer 4: [sub_cpl=0x00, sub_feat_idx, sub_func|swid, params...]
+
+        For multi-fragment sends, only the first fragment includes the bridge
+        prefix and header.  Continuation fragments carry raw sub_msg data.
+        The CPL flags byte encodes fragment index and continuation:
+          flags = (fragment_index << 1) | (1 if more_fragments else 0)
+        Single-frame messages use flags=0x00.
+
+        Returns the sub-device response data (after bridge header), or None.
+        """
+        if not getattr(self, "centurion", False):
+            raise ValueError("centurion_bridge_request called on non-Centurion device")
+        bridge_idx = getattr(self, "_centurion_bridge_index", None)
+        if bridge_idx is None:
+            raise ValueError("CentPPBridge index not discovered yet")
+        handle = self.handle or (self.receiver.handle if self.receiver else None)
+        if not handle:
+            return None
+
+        # Adjust bridge chunk sizes for 0x50 variant (device_addr byte takes 1 frame byte)
+        cent_state = base._centurion_handles.get(int(handle))
+        addr_overhead = 1 if cent_state and cent_state.report_id == base.CENTURION_ADDRESSED_REPORT_ID else 0
+        first_chunk = self._BRIDGE_FIRST_CHUNK - addr_overhead
+        cont_chunk = self._BRIDGE_CONT_CHUNK - addr_overhead
+
+        sw_id = base._get_next_sw_id()
+
+        # Build sub-device message: [sub_cpl=0x00, sub_feat_idx, sub_func|swid, params...]
+        # sub_function is in standard HID++ format: func_number << 4 (e.g. 0x10 for function 1)
+        sub_params = b"".join(struct.pack("B", p) if isinstance(p, int) else p for p in params) if params else b""
+        sub_msg = struct.pack("BBB", 0x00, sub_feat_idx, (sub_function & 0xF0) | sw_id) + sub_params
+
+        # Build bridge header: [device_id<<4 | len_hi, len_lo]
+        # device_id=0 for the headset, len is the total sub-message length
+        sub_len = len(sub_msg)
+        bridge_hdr = struct.pack("BB", (0x00 << 4) | ((sub_len >> 8) & 0x0F), sub_len & 0xFF)
+        bridge_prefix = struct.pack("BB", bridge_idx, (0x01 << 4) | sw_id)
+
+        timeout = base.DEFAULT_TIMEOUT
+        with base.acquire_timeout(base.handle_lock(handle), handle, timeout):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "bridge TX: sub_idx=%d func=0x%02X sw_id=%d payload=%s",
+                    sub_feat_idx,
+                    sub_function,
+                    sw_id,
+                    sub_params.hex() if sub_params else "",
+                )
+            if sub_len <= first_chunk:
+                # Single-frame path
+                layer3 = bridge_prefix + bridge_hdr + sub_msg
+                base.write_centurion_cpl(handle, layer3)
+            else:
+                # Multi-fragment send
+                # Fragment 0: bridge_prefix + bridge_hdr + first chunk of sub_msg
+                # Fragments 1+: raw sub_msg continuation data (no bridge overhead)
+                # CPL flags = (frag_index << 1) | (1 if more_fragments else 0)
+                # All fragments are sent back-to-back without waiting for
+                # intermediate ACKs. The device reassembles internally and
+                # sends a single ACK + MessageEvent after the last fragment.
+                frag_index = 0
+                offset = 0
+                while offset < sub_len:
+                    if frag_index == 0:
+                        chunk_size = first_chunk
+                        chunk = sub_msg[offset : offset + chunk_size]
+                        layer3 = bridge_prefix + bridge_hdr + chunk
+                    else:
+                        chunk_size = cont_chunk
+                        chunk = sub_msg[offset : offset + chunk_size]
+                        layer3 = chunk
+                    has_more = (offset + chunk_size) < sub_len
+                    flags = (frag_index << 1) | (1 if has_more else 0)
+                    base.write_centurion_cpl(handle, layer3, flags=flags)
+                    offset += len(chunk)
+                    frag_index += 1
+
+            if no_reply:
+                return None
+
+            # The device echoes our exact sub-device function+swid byte in
+            # MessageEvent responses. Match on that to reject cross-contamination
+            # from late-arriving responses to other function calls on the same
+            # feature (e.g. GetRGBZoneInfo response showing up on a later
+            # GetHostModeState read).
+            expected_sub_func_sw = (sub_function & 0xF0) | sw_id
+
+            # Read ACK + MessageEvent response
+            request_started = time.time()
+            ack_received = False
+            while time.time() - request_started < timeout:
+                reply = base._read(handle, timeout)
+                if not reply:
+                    continue
+                _report_id, _devnumber, reply_data = reply
+                # ACK: short response echoing feat_idx and func|swid
+                if len(reply_data) >= 2 and reply_data[0] == bridge_idx:
+                    func_sw = reply_data[1]
+                    if (func_sw >> 4) == 0x01 and (func_sw & 0x0F) == sw_id:
+                        ack_received = True
+                        break
+                    if (func_sw >> 4) == 0x01 and (func_sw & 0x0F) == 0:
+                        # MessageEvent arrived before ACK — validate it's for our request
+                        if self._is_bridge_response_for(reply_data, sub_feat_idx, expected_sub_func_sw):
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug("bridge idx=%d fn=0x%02X -> OK", sub_feat_idx, sub_function)
+                            return self._parse_bridge_response(reply_data)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "bridge skipping reply (pre-ACK): got sub_cpl=0x%02X sub_idx=0x%02X func_sw=0x%02X"
+                                " (expected idx=0x%02X func_sw=0x%02X) data=%s",
+                                reply_data[4] if len(reply_data) > 4 else 0,
+                                reply_data[5] if len(reply_data) > 5 else 0,
+                                reply_data[6] if len(reply_data) > 6 else 0,
+                                sub_feat_idx,
+                                expected_sub_func_sw,
+                                reply_data.hex(),
+                            )
+            if not ack_received:
+                logger.warning("centurion_bridge_request: no ACK received")
+                return None
+
+            # Read MessageEvent response (bridge function 1 with SW ID 0 = event)
+            while time.time() - request_started < timeout:
+                reply = base._read(handle, timeout)
+                if not reply:
+                    continue
+                _report_id, _devnumber, reply_data = reply
+                if len(reply_data) >= 2 and reply_data[0] == bridge_idx:
+                    func_sw = reply_data[1]
+                    if (func_sw >> 4) == 0x01 and (func_sw & 0x0F) == 0:
+                        if self._is_bridge_response_for(reply_data, sub_feat_idx, expected_sub_func_sw):
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug("bridge idx=%d fn=0x%02X -> OK", sub_feat_idx, sub_function)
+                            return self._parse_bridge_response(reply_data)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "bridge skipping reply (post-ACK): got sub_cpl=0x%02X sub_idx=0x%02X func_sw=0x%02X"
+                                " (expected idx=0x%02X func_sw=0x%02X) data=%s",
+                                reply_data[4] if len(reply_data) > 4 else 0,
+                                reply_data[5] if len(reply_data) > 5 else 0,
+                                reply_data[6] if len(reply_data) > 6 else 0,
+                                sub_feat_idx,
+                                expected_sub_func_sw,
+                                reply_data.hex(),
+                            )
+            logger.warning("centurion_bridge_request: no MessageEvent received")
+            return None
+
+    @staticmethod
+    def _wait_for_bridge_ack(handle, bridge_idx, sw_id, timeout):
+        """Wait for a bridge ACK response between multi-fragment sends."""
+        started = time.time()
+        while time.time() - started < timeout:
+            reply = base._read(handle, timeout)
+            if not reply:
+                continue
+            _report_id, _devnumber, reply_data = reply
+            if len(reply_data) >= 2 and reply_data[0] == bridge_idx:
+                func_sw = reply_data[1]
+                if (func_sw >> 4) == 0x01 and (func_sw & 0x0F) == sw_id:
+                    return True
+        return False
+
+    @staticmethod
+    def _is_bridge_response_for(reply_data, expected_sub_feat_idx, expected_sub_func_sw=None):
+        """Check if a bridge MessageEvent is a response for our specific sub-feature request.
+
+        Accepts both normal responses (sub_feat_idx matches) and error responses
+        (sub_feat_idx=0xFF with original feat_idx in next byte).
+        Unsolicited notifications (sub_cpl=0xFF) are rejected.
+
+        If `expected_sub_func_sw` is provided, also matches on the echoed
+        sub-device function byte (`(function << 4) | sw_id`). This prevents
+        cross-talk between different function calls on the SAME feature, which
+        can happen when a late-arriving response for one function gets picked
+        up by a later request on the same feature (observed on G522 where a
+        GetRGBZoneInfo response contaminated a subsequent GetHostModeState).
+        """
+        if len(reply_data) < 6:
+            return False
+        sub_cpl = reply_data[4]
+        sub_feat_idx = reply_data[5]
+        # Notifications have sub_cpl=0xFF; our responses have sub_cpl=0x00
+        if sub_cpl != 0x00:
+            return False
+        if sub_feat_idx == expected_sub_feat_idx:
+            if expected_sub_func_sw is not None and len(reply_data) >= 7:
+                if reply_data[6] != expected_sub_func_sw:
+                    return False
+            return True
+        # Error response: sub_feat_idx=0xFF, next byte is the original feat_idx that errored
+        if sub_feat_idx == 0xFF and len(reply_data) >= 7 and reply_data[6] == expected_sub_feat_idx:
+            if expected_sub_func_sw is not None and len(reply_data) >= 8:
+                if reply_data[7] != expected_sub_func_sw:
+                    return False
+            return True
+        return False
+
+    @staticmethod
+    def _parse_bridge_response(reply_data):
+        """Extract sub-device response from a CentPPBridge MessageEvent.
+
+        reply_data layout (after report_id and devnumber have been stripped):
+        [bridge_idx, func_sw, dev_id<<4|len_hi, len_lo, sub_cpl, sub_feat_idx, sub_func_sw, data...]
+        Returns the sub-device data starting from sub_feat_idx onward.
+
+        Error responses have sub_feat_idx=0xFF: [... sub_cpl, 0xFF, orig_feat_idx, orig_func_sw, error_code]
+        These return None.
+        """
+        if len(reply_data) < 7:
+            return None
+        sub_feat_idx = reply_data[5]
+        # Error response from sub-device
+        if sub_feat_idx == 0xFF:
+            # Error frame layout after sub_cpl: [0xFF, orig_feat_idx, orig_func_sw, error_code, ...]
+            orig_feat_idx = reply_data[6] if len(reply_data) > 6 else 0
+            orig_func_sw = reply_data[7] if len(reply_data) > 7 else 0
+            error_code = reply_data[8] if len(reply_data) > 8 else 0
+            logger.debug(
+                "bridge sub-device error: orig_feat_idx=%d orig_func=0x%02X error=0x%02X",
+                orig_feat_idx,
+                orig_func_sw,
+                error_code,
+            )
+            return None
+        return reply_data[7:]  # response data after sub_cpl, sub_feat_idx, sub_func_sw
+
+    def _record_ping_protocol(self, handle, protocol):
+        """Record a successful ping's protocol version, including raw Centurion (major, minor)."""
+        self._protocol = protocol
+        cent_state = base._centurion_handles.get(int(handle))
+        if cent_state and cent_state.protocol_version:
+            self._centurion_protocol = cent_state.protocol_version
 
     def ping(self):
         """Checks if the device is online and present, returns True of False.
         Some devices are integral with their receiver but may not be present even if the receiver responds to ping."""
+        if self.centurion and self.receiver and not self.handle:
+            # Centurion child: first check if dongle is reachable
+            handle = self.receiver.handle
+            try:
+                protocol = self.low_level.ping(handle, 0xFF, long_message=True)
+            except exceptions.NoReceiver:
+                self.online = False
+                return False
+            if protocol:
+                self._record_ping_protocol(handle, protocol)
+            # Dongle responded — now check if headset is actually on by probing through bridge.
+            # Send ROOT.GetFeature(0x0001) to the sub-device via CentPPBridge.
+            bridge_idx = getattr(self, "_centurion_bridge_index", None)
+            if bridge_idx is not None:
+                try:
+                    result = self.centurion_bridge_request(0, 0x00, 0x00, 0x01)
+                    self.online = result is not None and self.present
+                except Exception:
+                    self.online = False
+            else:
+                self.online = False
+            return self.online
         long = self.hidpp_long is True or (
             self.hidpp_long is None and (self.bluetooth or self._protocol is not None and self._protocol >= 2.0)
         )
@@ -560,7 +1029,7 @@ class Device:
             protocol = None
         self.online = protocol is not None and self.present
         if protocol:
-            self._protocol = protocol
+            self._record_ping_protocol(handle, protocol)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("pinged %s: online %s protocol %s present %s", self.number, self.online, protocol, self.present)
         return self.online
@@ -569,12 +1038,22 @@ class Device:
         pass
 
     def close(self):
-        handle, self.handle = self.handle, None
-        if self in Device.instances:
-            Device.instances.remove(self)
+        # Idempotent: __del__ re-invokes close() at interpreter shutdown, where
+        # re-running cleanups can't safely build settings. Flag, not self.handle
+        # (None for receiver-paired devices that borrow the receiver's handle).
+        if getattr(self, "_closed", False):
+            return None
+        self._closed = True
+        # Run device.cleanups before clearing self.handle — cleanup callbacks
+        # typically need to issue final feature_request() writes (e.g. release
+        # SW control, restore device-side state) and feature_request() relies
+        # on self.handle being set.
         if hasattr(self, "cleanups"):
             for cleanup in self.cleanups:
                 cleanup(self)
+        handle, self.handle = self.handle, None
+        if self in Device.instances:
+            Device.instances.remove(self)
         return handle and self.low_level.close(handle)
 
     def __index__(self):
@@ -610,3 +1089,8 @@ class Device:
 
     def __del__(self):
         self.close()
+
+
+# Re-export from centurion.py — must be after Device class to avoid circular import
+from .centurion import CenturionReceiver  # noqa: E402,F401
+from .centurion import create_centurion_receiver  # noqa: E402,F401

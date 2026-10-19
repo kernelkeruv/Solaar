@@ -24,6 +24,7 @@ import gi
 
 from logitech_receiver import hidpp20
 from logitech_receiver import settings
+from logitech_receiver import settings_templates
 
 from solaar.i18n import _
 from solaar.i18n import ngettext
@@ -56,7 +57,8 @@ def _read_async(setting, force_read, sbox, device_is_online, sensitive):
         except Exception as e:
             v = None
             logger.warning("%s: error reading so use None (%s): %s", s.name, s._device, repr(e))
-        GLib.idle_add(_update_setting_item, sb, v, online, sensitive, True, priority=99)
+        null_okay = not getattr(getattr(s, "_validator", None), "readable", True)
+        GLib.idle_add(_update_setting_item, sb, v, online, sensitive, null_okay, priority=99)
 
     ui_async(_do_read, setting, force_read, sbox, device_is_online, sensitive)
 
@@ -144,6 +146,13 @@ class SliderControl(Gtk.Scale, Control):
         self.set_round_digits(0)
         self.set_digits(0)
         self.set_increments(1, 5)
+        # Halving tick marks are an intensity-slider feature only.
+        if self.sbox.setting.name == "brightness_control":
+            validator = getattr(self.sbox.setting, "_validator", None)
+            steps = getattr(validator, "steps", 0) if validator is not None else 0
+            if steps:
+                for mark in settings_templates.halving_marks(validator.max_value, steps):
+                    self.add_mark(mark, Gtk.PositionType.BOTTOM, None)
         self.connect(GtkSignal.VALUE_CHANGED.value, self.changed)
 
     def set_value(self, value):
@@ -545,7 +554,94 @@ class PackedRangeControl(MultipleRangeControl):
         self._button.set_tooltip_text(b)
 
 
+class GraphicEQControl(MultipleControl):
+    def setup(self, setting):
+        self._items = []
+        validator = setting._validator
+        row = Gtk.ListBoxRow()
+        hbox = Gtk.HBox(homogeneous=True, spacing=8)
+        for item in range(validator.count):
+            vbox = Gtk.VBox(homogeneous=False, spacing=2)
+            scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, validator.min_value, validator.max_value, 1)
+            scale.set_inverted(True)
+            scale.set_round_digits(0)
+            scale.set_digits(0)
+            scale.set_draw_value(True)
+            scale.connect("format-value", lambda s, v: f"{int(v)} dB")
+            scale.set_has_origin(True)
+            scale.set_size_request(-1, 150)
+            scale.add_mark(0, Gtk.PositionType.LEFT, "0")
+            scale.connect(GtkSignal.VALUE_CHANGED.value, self._changed, validator.keys[item])
+            lbl = Gtk.Label(label=str(validator.keys[item]))
+            lbl.set_line_wrap(True)
+            lbl.set_justify(Gtk.Justification.CENTER)
+            vbox.pack_start(scale, True, True, 0)
+            vbox.pack_end(lbl, False, False, 0)
+            vbox._setting_item = validator.keys[item]
+            vbox.control = scale
+            hbox.pack_start(vbox, True, True, 0)
+            self._items.append(vbox)
+        row.add(hbox)
+        self.add(row)
+
+    def _changed(self, control, item):
+        if control.get_sensitive():
+            if hasattr(control, "_timer"):
+                control._timer.cancel()
+            control._timer = Timer(0.5, lambda: GLib.idle_add(self._write, control, item))
+            control._timer.start()
+
+    def _write(self, control, item):
+        control._timer.cancel()
+        delattr(control, "_timer")
+        new_state = int(control.get_value())
+        value = self.sbox.setting._value
+        if not isinstance(value, dict):
+            return
+        if value.get(int(item)) != new_state:
+            value[int(item)] = new_state
+            _write_async(self.sbox.setting, value[int(item)], self.sbox, key=int(item))
+
+    def set_value(self, value):
+        if value is None:
+            return
+        b = ""
+        n = len(self._items)
+        stored = self.sbox.setting._value if isinstance(self.sbox.setting._value, dict) else {}
+        for vbox in self._items:
+            item = vbox._setting_item
+            v = value.get(int(item))
+            if v is not None:
+                vbox.control.set_value(v)
+            else:
+                v = stored.get(int(item), 0)
+            b += f"{str(item)}: ({str(v)}) "
+        lbl_text = ngettext("%d value", "%d values", n) % n
+        self._button.set_label(lbl_text)
+        self._button.set_tooltip_text(b)
+
+
 # control with an ID key that determines what else to show
+class _HeteroToggleSwitch(Gtk.Switch):
+    """Gtk.Switch with int-valued get/set_value for HeteroKeyControl.
+
+    Maps switch True/False to the field's wire on/off integer values so the
+    surrounding control machinery (changed handler, get_value, set_value) can
+    stay int-based like every other field kind.
+    """
+
+    def __init__(self, on_value: int = 1, off_value: int = 2, **kwargs):
+        super().__init__(**kwargs)
+        self._on = int(on_value)
+        self._off = int(off_value)
+
+    def get_value(self) -> int:
+        return self._on if self.get_state() else self._off
+
+    def set_value(self, value) -> None:
+        self.set_state(int(value) == self._on)
+
+
 class HeteroKeyControl(Gtk.HBox, Control):
     def __init__(self, sbox, delegate=None):
         super().__init__(homogeneous=False, spacing=6)
@@ -566,6 +662,17 @@ class HeteroKeyControl(Gtk.HBox, Control):
                 item_box.set_active(0)
                 item_box.connect(GtkSignal.CHANGED.value, self.changed)
                 self.pack_start(item_box, False, False, 0)
+            elif item["kind"] == settings.Kind.TOGGLE:
+                # Right-align like standard TOGGLE settings — pack_end so the
+                # switch hugs the right edge while other fields stay left.
+                item_box = _HeteroToggleSwitch(
+                    on_value=item.get("on_value", 1),
+                    off_value=item.get("off_value", 2),
+                    halign=Gtk.Align.CENTER,
+                    valign=Gtk.Align.CENTER,
+                )
+                item_box.connect(GtkSignal.NOTIFY_ACTIVE.value, self.changed)
+                self.pack_end(item_box, False, False, 0)
             elif item["kind"] == settings.Kind.COLOR:
                 item_box = Gtk.ColorButton()
                 item_box.connect(GtkSignal.COLOR_SET.value, self.changed)
@@ -576,6 +683,15 @@ class HeteroKeyControl(Gtk.HBox, Control):
                 item_box.set_round_digits(0)
                 item_box.set_digits(0)
                 item_box.set_increments(1, 5)
+                # Halving tick marks are an intensity-slider feature only.
+                if item.get("halving") and str(item.get("name")) == str(hidpp20.LEDParam.intensity):
+                    steps = getattr(sbox.setting._device, "_brightness_steps", 0) or settings_templates.auto_step_count(
+                        item["max"]
+                    )
+                    for mark in settings_templates.halving_marks(item["max"], steps):
+                        item_box.add_mark(mark, Gtk.PositionType.BOTTOM, None)
+                if item.get("display_seconds", False):
+                    item_box.connect("format-value", lambda _s, v: f"{int(v) / 1000:.2f}s")
                 item_box.connect(GtkSignal.VALUE_CHANGED.value, self.changed)
                 self.pack_start(item_box, True, True, 0)
             item_box.set_visible(False)
@@ -592,11 +708,14 @@ class HeteroKeyControl(Gtk.HBox, Control):
                 result[str(k)] = (r << 16) | (g << 8) | b
             else:
                 result[str(k)] = box.get_value()
-        result = hidpp20.LEDEffectSetting(**result)
+        data_class = getattr(self.sbox.setting._validator, "data_class", hidpp20.LEDEffectSetting)
+        result = data_class(**result)
         return result
 
     def set_value(self, value):
         self.set_sensitive(False)
+        id_ = value.ID if value is not None else 0
+        self._apply_id_ranges(id_)
         if value is not None:
             for k, v in value.__dict__.items():
                 if k in self._items:
@@ -608,9 +727,7 @@ class HeteroKeyControl(Gtk.HBox, Control):
                         box.set_rgba(rgba)
                     else:
                         box.set_value(v)
-        else:
-            self.sbox._failed.set_visible(True)
-        self.setup_visibles(value.ID if value is not None else 0)
+        self.setup_visibles(id_)
 
     def setup_visibles(self, id_):
         fields = self.sbox.setting.fields_map[id_][1] if id_ in self.sbox.setting.fields_map else {}
@@ -620,14 +737,60 @@ class HeteroKeyControl(Gtk.HBox, Control):
                 lblbox.set_visible(visible)
             box.set_visible(visible)
 
-    def changed(self, control):
+    def changed(self, control, *_args):
+        # *_args swallows the extra GParamSpec passed by Gtk.Switch's
+        # "notify::active" signal — other field signals pass just (widget,).
         if self.get_sensitive() and control.get_sensitive():
             if "ID" in self._items and control == self._items["ID"][1]:
-                self.setup_visibles(int(self._items["ID"][1].get_value()))
+                new_id = int(self._items["ID"][1].get_value())
+                self.setup_visibles(new_id)
+                self._apply_id_ranges(new_id)
+                self._apply_id_defaults(new_id)
             if hasattr(control, "_timer"):
                 control._timer.cancel()
             control._timer = Timer(0.3, lambda: GLib.idle_add(self._write, control))
             control._timer.start()
+
+    def _apply_id_ranges(self, id_):
+        """Reset every RANGE widget to its field's global min/max, then apply
+        per-effect overrides from fields_map[id_][3]. Reset-first ensures
+        switching from an override (e.g. Ripple 2-200) to an effect without
+        one restores the global range instead of inheriting the narrow one."""
+        fields_map = getattr(self.sbox.setting, "fields_map", None)
+        entry = fields_map.get(id_) if fields_map else None
+        ranges = entry[3] if entry and len(entry) > 3 else {}
+        for field in self.sbox.setting.possible_fields:
+            if field.get("kind") != settings.Kind.RANGE:
+                continue
+            name = str(field["name"])
+            if name not in self._items:
+                continue
+            _, box = self._items[name]
+            lo, hi = ranges.get(field["name"], (field.get("min", 0), field.get("max", 0)))
+            box.set_range(lo, hi)
+
+    def _apply_id_defaults(self, id_):
+        """Apply fields_map[id_][2] defaults to RANGE widgets sitting at min."""
+        fields_map = getattr(self.sbox.setting, "fields_map", None)
+        if not fields_map or id_ not in fields_map:
+            return
+        entry = fields_map[id_]
+        if len(entry) < 3:
+            return
+        defaults = entry[2]
+        ranges = entry[3] if len(entry) > 3 else {}
+        field_by_name = {str(f["name"]): f for f in self.sbox.setting.possible_fields}
+        for param_name, default_value in defaults.items():
+            name = str(param_name)
+            if name not in self._items:
+                continue
+            field = field_by_name.get(name)
+            if field is None or field.get("kind") != settings.Kind.RANGE:
+                continue
+            _, box = self._items[name]
+            effective_min = ranges[param_name][0] if param_name in ranges else field.get("min", 0)
+            if box.get_value() == effective_min:
+                box.set_value(default_value)
 
     def _write(self, control):
         control._timer.cancel()
@@ -648,6 +811,144 @@ _icons_allowables = {v: k for k, v in _allowables_icons.items()}
 
 
 # clicking on the lock icon changes from changeable to unchangeable to ignore
+# Settings whose operation depends on LED Control being set to Solaar.
+# Zone settings (rgb_zone_*) are matched by prefix because their name carries
+# the zone index (rgb_zone_1, rgb_zone_2, ...).
+_SW_CONTROL_DEPENDENT_NAMES = ("rgb_idle_timeout", "rgb_idle_effect", "rgb_sleep_timeout")
+_SW_CONTROL_DEPENDENT_PREFIXES = ("rgb_zone_",)
+# headset_led_control = whether Solaar holds the live-coloring claim (off lets
+# another app drive the LEDs). The 0x0620 per-zone painting and the 0x0621
+# onboard effect are both live LED control, so both need the claim; per-zone
+# additionally needs the onboard effect on Static (the per-key analog of
+# needs-rgb_control + zone-Static). The 0x0622 signature effects are stored
+# settings (startup/shutdown colors) and stay ungated.
+_HEADSET_LED_DEPENDENT_NAMES = ("headset_per_zone_lighting", "headset-onboard-effect")
+
+
+def _sw_control_blocked(device):
+    """True when LED Control is not Solaar. Reads from setting._value first,
+    then the persister, so the gate is right at panel load before live reads
+    have populated. Accepts either the current bool (BooleanValidator) or the
+    legacy int 3/0 (older ChoicesValidator persister entries)."""
+    persister = getattr(device, "persister", None)
+    if persister is None:
+        return False
+    value = None
+    for s in getattr(device, "settings", []) or []:
+        if s.name == "rgb_control":
+            value = s._value
+            break
+    if value is None:
+        value = persister.get("rgb_control")
+    if value is None:
+        return False
+    # Solaar = bool True or legacy int 3; everything else (False, 0, …) blocks.
+    return value not in (True, 3)
+
+
+def _headset_led_blocked(device):
+    """True when the headset's LED Control is off (Device/firmware mode).
+    Reads setting._value first, then the persister; accepts the current bool
+    or a legacy int 0/1 from the old ChoicesValidator persister entries."""
+    persister = getattr(device, "persister", None)
+    if persister is None:
+        return False
+    value = None
+    for s in getattr(device, "settings", []) or []:
+        if s.name == "headset_led_control":
+            value = s._value
+            break
+    if value is None:
+        value = persister.get("headset_led_control")
+    if value is None:
+        return False
+    return value not in (True, 1)
+
+
+def _cluster_effect_blocks_perzone(device):
+    """True when the headset's 0x0621 onboard effect is not Fixed — a
+    non-Fixed cluster animation masks the per-zone buffer. Mirrors
+    `_zone_effect_blocks_perkey`. False when the device has no
+    onboard-effect setting (nothing to mask against)."""
+    persister = getattr(device, "persister", None)
+    value = None
+    for s in getattr(device, "settings", []) or []:
+        if s.name == "headset-onboard-effect":
+            value = s._value if s._value is not None else (persister.get(s.name) if persister else None)
+            break
+    else:
+        return False
+    if value is None:
+        return False
+    return int(getattr(value, "ID", 0)) != 0
+
+
+def _zone_effect_blocks_perkey(device):
+    """True when any zone effect's saved ID is not Static (0x01) — zone
+    animations mask the per-key buffer regardless of SW control state."""
+    persister = getattr(device, "persister", None)
+    if persister is None:
+        return False
+    for s in getattr(device, "settings", []) or []:
+        if not s.name.startswith("rgb_zone_"):
+            continue
+        v = s._value if s._value is not None else persister.get(s.name)
+        if v is None:
+            continue
+        if int(getattr(v, "ID", 0) or 0) != 0x01:
+            return True
+    return False
+
+
+def _set_row_sensitive(device, name, can_function):
+    """Apply sensitivity to a single setting's control row. Combines the
+    user's lock-icon opt-in (persister sensitivity) with the can-function
+    gate so neither alone can override the other."""
+    device_id = (device.receiver.path if device.receiver else device.path, device.number)
+    sbox = _items.get((device_id[0], device_id[1], name))
+    if sbox is None or not hasattr(sbox, "_control"):
+        return
+    persister = getattr(device, "persister", None)
+    user_allowed = persister.get_sensitivity(name) if persister else True
+    sbox._control.set_sensitive(user_allowed is True and can_function)
+
+
+def _gate_blocks(device, name):
+    """Single source of truth for "is this setting's row gated off?". Used by
+    `_apply_rgb_gates` to grey rows and by `_update_setting_item` so async-read
+    completions can't undo the grey-out when their callbacks land later."""
+    if name in _SW_CONTROL_DEPENDENT_NAMES or any(name.startswith(p) for p in _SW_CONTROL_DEPENDENT_PREFIXES):
+        return _sw_control_blocked(device)
+    if name == "per-key-lighting":
+        return _sw_control_blocked(device) or _zone_effect_blocks_perkey(device)
+    if name in _HEADSET_LED_DEPENDENT_NAMES:
+        if _headset_led_blocked(device):
+            return True
+        # Per-zone painting additionally needs the onboard effect on Static.
+        return name == "headset_per_zone_lighting" and _cluster_effect_blocks_perzone(device)
+    return False
+
+
+def _apply_rgb_gates(device):
+    """Grey out RGB settings whose prerequisites aren't met. Visual-only:
+    leaves persister _sensitive flags (user lock-icon opt-ins) intact.
+
+    - rgb_zone_* and rgb_idle_*/rgb_sleep_timeout need LED Control = Solaar
+      (rgb_control == 3).
+    - per-key-lighting needs LED Control = Solaar AND every zone effect on
+      Static (0x01), because non-Static zone animations mask per-key writes.
+    """
+    for s in getattr(device, "settings", []) or []:
+        name = s.name
+        if (
+            name in _SW_CONTROL_DEPENDENT_NAMES
+            or any(name.startswith(p) for p in _SW_CONTROL_DEPENDENT_PREFIXES)
+            or name == "per-key-lighting"
+            or name in _HEADSET_LED_DEPENDENT_NAMES
+        ):
+            _set_row_sensitive(device, name, not _gate_blocks(device, name))
+
+
 def _change_click(button, sbox):
     icon = button.get_children()[0]
     icon_name, _ = icon.get_icon_name()
@@ -665,6 +966,37 @@ def _change_click(button, sbox):
                 _write_async(setting, persisted, sbox)
             else:
                 _read_async(setting, True, sbox, bool(sbox.setting._device.online), sbox._control.get_sensitive())
+    elif new_allowed == settings.SENSITIVITY_IGNORE and sbox.setting.name == "per-key-lighting":
+        # User just opted out of per-key lighting. The firmware effect engine
+        # is currently in its OOR "direct mode" slot showing the per-key buffer
+        # (entered when the prep sequence wrote effectIdx=numEffects via
+        # SetEffectByIndex on 0x8071). Writing a regular in-range effectIdx
+        # with persist=1 displaces that slot and the saved zone effect becomes
+        # the visible layer again. See LOGITECH_HIDPP2_PROTOCOL.md
+        # "Per-key prep sequence" and 0x8071 SetEffectByIndex persist=1
+        # requirement.
+        device = sbox.setting._device
+        for s in device.settings:
+            if s.name.startswith("rgb_zone_") and s._value is not None:
+                _write_async(s, s._value, None)
+                break  # one zone-effect write is enough to flip the engine
+    if sbox.setting.name.startswith("rgb_zone_"):
+        # Toggling zone-effect sensitivity changes the effective base color
+        # for per-key unset cells (zone color ↔ black). When per-key is
+        # opted-in, repaint it so the unset cells pick up the new base.
+        from logitech_receiver import rgb_power
+
+        device = sbox.setting._device
+        perkey, has_paint = rgb_power.perkey_has_paint(device)
+        if has_paint:
+            _write_async(perkey, perkey._value, None)
+    # The lock icon on rgb_control, any zone, per-key, or headset_led_control
+    # can change whether a dependent row is functional — re-evaluate the gate.
+    name = sbox.setting.name
+    if name in ("rgb_control", "per-key-lighting", "headset_led_control", "headset-onboard-effect") or name.startswith(
+        "rgb_zone_"
+    ):
+        _apply_rgb_gates(sbox.setting._device)
     return True
 
 
@@ -701,7 +1033,24 @@ def _create_sbox(s, _device):
     change.set_sensitive(True)
     change.connect(GtkSignal.CLICKED.value, _change_click, sbox)
 
-    if s.kind == settings.Kind.TOGGLE:
+    editor_path = getattr(s, "editor_class", None)
+    if editor_path:
+        try:
+            mod_name, _sep, cls_name = editor_path.partition(":")
+            import importlib
+
+            mod = importlib.import_module(mod_name)
+            cls = getattr(mod, cls_name)
+            control = cls(sbox)
+        except Exception as e:
+            logger.warning("setting %s editor_class %r failed (%s); falling back to default", s.name, editor_path, repr(e))
+            control = None
+    else:
+        control = None
+
+    if control is not None:
+        pass
+    elif s.kind == settings.Kind.TOGGLE:
         control = ToggleControl(sbox)
     elif s.kind == settings.Kind.RANGE:
         control = SliderControl(sbox)
@@ -715,6 +1064,8 @@ def _create_sbox(s, _device):
         control = MultipleRangeControl(sbox, change)
     elif s.kind == settings.Kind.PACKED_RANGE:
         control = PackedRangeControl(sbox, change)
+    elif s.kind == settings.Kind.GRAPHIC_EQ:
+        control = GraphicEQControl(sbox, change)
     elif s.kind == settings.Kind.HETERO:
         control = HeteroKeyControl(sbox, change)
     else:
@@ -733,8 +1084,10 @@ def _create_sbox(s, _device):
 def _update_setting_item(sbox, value, is_online=True, sensitive=True, null_okay=False):
     sbox._spinner.stop()
     sensitive = sbox._change_icon._allowed if sensitive is None else sensitive
+    name = sbox.setting.name
+    can_function = not _gate_blocks(sbox.setting._device, name)
     if value is None and not null_okay:
-        sbox._control.set_sensitive(sensitive is True)
+        sbox._control.set_sensitive(sensitive is True and can_function)
         _change_icon(sensitive, sbox._change_icon)
         sbox._failed.set_visible(is_online)
         return
@@ -744,8 +1097,12 @@ def _update_setting_item(sbox, value, is_online=True, sensitive=True, null_okay=
         sbox._control.set_value(value)
     except TypeError as e:
         logger.warning("%s: error setting control value (%s): %s", sbox.setting.name, sbox.setting._device, repr(e))
-    sbox._control.set_sensitive(sensitive is True)
+    sbox._control.set_sensitive(sensitive is True and can_function)
     _change_icon(sensitive, sbox._change_icon)
+    # rgb_control / rgb_zone_* gate per-key; headset_led_control and the
+    # headset-onboard-effect gate the per-zone row — re-evaluate on a change.
+    if name in ("rgb_control", "headset_led_control", "headset-onboard-effect") or name.startswith("rgb_zone_"):
+        _apply_rgb_gates(sbox.setting._device)
 
 
 def _disable_listbox_highlight_bg(lb):
@@ -796,6 +1153,7 @@ def update(device, is_online=None):
         k = (device_id[0], device_id[1], s.name)
         if k in _items:
             sbox = _items[k]
+            sbox.setting = s  # use setting from current version of device
         else:
             sbox = _create_sbox(s, device)
             if sbox is None:
@@ -805,6 +1163,7 @@ def update(device, is_online=None):
         sensitive = device.persister.get_sensitivity(s.name) if device.persister else True
         _read_async(s, False, sbox, is_online, sensitive)
 
+    _apply_rgb_gates(device)
     _box.set_visible(True)
 
 

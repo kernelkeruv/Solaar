@@ -101,7 +101,8 @@ def _match(action: str, device, filter_func: typing.Callable[[int, int, int, boo
     try:  # if report descriptor does not indicate HID++ capabilities then this device is not of interest to Solaar
         from hid_parser import ReportDescriptor
 
-        hidpp_short = hidpp_long = False
+        hidpp_short = hidpp_long = centurion = False
+        centurion_report_id = None
         devfile = "/sys" + hid_device.properties.get("DEVPATH") + "/report_descriptor"
         with fileopen(devfile, "rb") as fd:
             with warnings.catch_warnings():
@@ -111,11 +112,22 @@ def _match(action: str, device, filter_func: typing.Callable[[int, int, int, boo
             # and _Usage(0xFF00, 0x0001) in rd.get_input_items(0x10)[0].usages  # be more permissive
             hidpp_long = 0x11 in rd.input_report_ids and 19 * 8 == int(rd.get_input_report_size(0x11))
             # and _Usage(0xFF00, 0x0002) in rd.get_input_items(0x11)[0].usages  # be more permissive
-        if not hidpp_short and not hidpp_long:
+            # Centurion transport: 63-byte reports on usage page 0xFFA0 (both input and output)
+            # 0x51 = PRO X 2 LIGHTSPEED variant, 0x50 = G522 LIGHTSPEED variant (with device address byte)
+            if 0x51 in rd.input_report_ids and 63 * 8 == int(rd.get_input_report_size(0x51)) and 0x51 in rd.output_report_ids:
+                centurion_report_id = 0x51
+            elif (
+                0x50 in rd.input_report_ids and 63 * 8 == int(rd.get_input_report_size(0x50)) and 0x50 in rd.output_report_ids
+            ):
+                centurion_report_id = 0x50
+            centurion = centurion_report_id is not None
+        if not hidpp_short and not hidpp_long and not centurion:
             return
     except Exception as e:  # if can't process report descriptor fall back to old scheme
         hidpp_short = None
         hidpp_long = None
+        centurion = False
+        centurion_report_id = None
         logger.info(
             "Report Descriptor not processed for DEVICE %s BID %s VID %s PID %s: %s",
             device.device_node,
@@ -125,7 +137,7 @@ def _match(action: str, device, filter_func: typing.Callable[[int, int, int, boo
             e,
         )
 
-    filtered_result = filter_func(int(bid, 16), int(vid, 16), int(pid, 16), hidpp_short, hidpp_long)
+    filtered_result = filter_func(int(bid, 16), int(vid, 16), int(pid, 16), hidpp_short or centurion, hidpp_long or centurion)
     if not filtered_result:
         return
     interface_number = filtered_result.get("usb_interface")
@@ -165,6 +177,8 @@ def _match(action: str, device, filter_func: typing.Callable[[int, int, int, boo
             isDevice=isDevice,
             hidpp_short=hidpp_short,
             hidpp_long=hidpp_long,
+            centurion=centurion if centurion else False,
+            centurion_report_id=centurion_report_id,
         )
         return d_info
 
@@ -403,6 +417,8 @@ def read(device_handle, bytes_count, timeout_ms=-1):
         data = os.read(device_handle, bytes_count)
         assert data is not None
         assert isinstance(data, bytes), (repr(data), type(data))
+        if not data:  # empty read when select() said readable means EOF (device removed)
+            raise OSError(errno.EIO, f"device disconnected on file descriptor {int(device_handle)}")
         return data
     else:
         return b""

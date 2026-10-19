@@ -16,8 +16,8 @@
 ## 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 from __future__ import annotations
 
-from enum import Flag
 from enum import IntEnum
+from enum import IntFlag
 from typing import List
 
 from .common import NamedInts
@@ -68,7 +68,7 @@ class PowerSwitchLocation(IntEnum):
             return cls.UNKNOWN
 
 
-class NotificationFlag(Flag):
+class NotificationFlag(IntFlag):
     """Some flags are used both by devices and receivers.
 
     The Logitech documentation mentions that the first and last (third)
@@ -91,7 +91,12 @@ class NotificationFlag(Flag):
     @classmethod
     def flag_names(cls, flags) -> List[str]:
         """Extract the names of the flags from the integer."""
-        return flags.name.replace("_", " ").lower().split("|")
+        if flags is None:
+            return []
+        if flags.name is not None:
+            return flags.name.replace("_", " ").lower().split("|")
+        # Python < 3.11: .name is None for composite flags, decompose manually
+        return [m.name.replace("_", " ").lower() for m in cls if m.value and m in flags]
 
     NUMPAD_NUMERICAL_KEYS = 0x800000
     F_LOCK_STATUS = 0x400000
@@ -207,7 +212,7 @@ class InfoSubRegisters(IntEnum):
     BOLT_DEVICE_NAME = 0x60  # 0x6N01, by connected device
 
 
-class DeviceFeature(Flag):
+class DeviceFeature(IntFlag):
     """Features for devices.
 
     Flags taken from

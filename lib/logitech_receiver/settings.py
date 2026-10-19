@@ -27,6 +27,7 @@ from solaar.i18n import _
 from . import common
 from . import hidpp20_constants
 from . import settings_validator
+from .centurion_constants import CenturionCoreFeature
 from .common import NamedInt
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class Kind(IntEnum):
     MAP_CHOICE = 0x0A
     MULTIPLE_TOGGLE = 0x10
     PACKED_RANGE = 0x20
+    GRAPHIC_EQ = 0x21
     MULTIPLE_RANGE = 0x40
     HETERO = 0x80
     MAP_RANGE = 0x102
@@ -59,6 +61,15 @@ class Setting:
     validator_class = None
     validator_options = {}
     display = True  # display setting in UI
+    # Set False for settings whose value cannot be read back from the device
+    # (e.g. PerKeyLighting — the 0x8081 protocol has no GetIndividualRgbZones).
+    # `solaar show` uses this to suppress the "(live)" output line that would
+    # otherwise print a fabricated value misleadingly.
+    live_readable = True
+    # Optional UI editor override as "module.path:ClassName". Resolved by the
+    # config panel before the Kind dispatch. Kept as a string so this module
+    # stays free of GTK imports — the FE/BE seam is preserved.
+    editor_class: str | None = None
 
     def __init__(self, device, rw, validator):
         self._device = device
@@ -170,8 +181,16 @@ class Setting:
                     logger.debug("%s: prepare write(%s) => %r", self.name, value, data_bytes)
 
                 reply = self._rw.write(self._device, data_bytes)
-                if not reply:
-                    # tell whomever is calling that the write failed
+                # HID++ 2.0 "set" operations often return an empty ACK (b"").
+                # Treating empty bytes as failure (`not reply`) would misreport
+                # successful writes as errors to the GUI. Only report failure
+                # when the transport actually returned None (error or timeout).
+                if reply is None:
+                    logger.info(
+                        "%s: write on %s returned no reply (transport error/timeout)",
+                        self.name,
+                        self._device,
+                    )
                     return None
 
             return value
@@ -627,7 +646,7 @@ class FeatureRW:
         read_prefix=b"",
         no_reply=False,
     ):
-        assert isinstance(feature, hidpp20_constants.SupportedFeature)
+        assert isinstance(feature, (hidpp20_constants.SupportedFeature, CenturionCoreFeature))
         self.feature = feature
         self.read_fnid = read_fnid
         self.write_fnid = write_fnid
@@ -664,7 +683,7 @@ class FeatureRWMap(FeatureRW):
         key_byte_count=default_key_byte_count,
         no_reply=False,
     ):
-        assert isinstance(feature, hidpp20_constants.SupportedFeature)
+        assert isinstance(feature, (hidpp20_constants.SupportedFeature, CenturionCoreFeature))
         self.feature = feature
         self.read_fnid = read_fnid
         self.write_fnid = write_fnid
