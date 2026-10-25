@@ -1,6 +1,8 @@
 """Standard library only; no physical device required."""
+
 import importlib.util
 import unittest
+
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parents[1]
@@ -27,8 +29,10 @@ class FedoraToolsTests(unittest.TestCase):
         self.assertIsInstance(r["hidraw"]["count"], int)
 
     def test_plan_never_invokes_shell(self):
-        self.assertEqual(plan.commands({"device": "Mouse", "settings": [{"setting": "dpi", "value": "1200"}]}),
-                         [["solaar", "config", "Mouse", "dpi", "1200"]])
+        self.assertEqual(
+            plan.commands({"device": "Mouse", "settings": [{"setting": "dpi", "value": "1200"}]}),
+            [["solaar", "config", "Mouse", "dpi", "1200"]],
+        )
 
     def test_invalid_keys(self):
         with self.assertRaises(ValueError):
@@ -44,6 +48,7 @@ class FedoraToolsTests(unittest.TestCase):
 
     def test_os_release_parser(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             f = Path(tmp) / "os-release"
             f.write_text('ID="fedora"\nVERSION_ID="44"\nPRETTY_NAME="Test"\n')

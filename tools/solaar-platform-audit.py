@@ -11,7 +11,9 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 
 
@@ -39,8 +41,12 @@ def safe_command(*argv):
         return None
     try:
         run = subprocess.run(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, timeout=4, check=False,
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=4,
+            check=False,
         )
         return run.stdout.strip() if run.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
@@ -77,11 +83,13 @@ def collect():
     mode = (os.environ.get("XDG_SESSION_TYPE") or "unknown").lower()
     rule_name = "42-logitech-unify-permissions.rules"
     rules = [
-        p for p in (
+        p
+        for p in (
             f"/etc/udev/rules.d/{rule_name}",
             f"/usr/lib/udev/rules.d/{rule_name}",
             f"/lib/udev/rules.d/{rule_name}",
-        ) if Path(p).is_file()
+        )
+        if Path(p).is_file()
     ]
     uinput = Path("/dev/uinput")
     report = {
@@ -118,7 +126,21 @@ def main(argv=None):
         print(json.dumps(report, sort_keys=True, indent=2))
         return 0
     print("Solaar Fedora/RHEL read-only platform audit")
-    for field in ("timestamp_utc", "distribution", "kernel_release", "session_type", "selinux", "secure_boot_indicator", "kernel_fips_indicator", "system_crypto_policy", "solaar_available", "solaar_udev_rule_present", "hidraw", "uinput", "kernel_hid_modules"):
+    for field in (
+        "timestamp_utc",
+        "distribution",
+        "kernel_release",
+        "session_type",
+        "selinux",
+        "secure_boot_indicator",
+        "kernel_fips_indicator",
+        "system_crypto_policy",
+        "solaar_available",
+        "solaar_udev_rule_present",
+        "hidraw",
+        "uinput",
+        "kernel_hid_modules",
+    ):
         print(f"{field}: {report[field]}")
     print("FIPS compliance verified: NO (not assessed)")
     if report["kernel_fips_indicator"] != "enabled":
