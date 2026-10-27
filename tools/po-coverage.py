@@ -9,6 +9,7 @@ import argparse
 import ast
 import json
 import re
+
 from pathlib import Path
 
 
@@ -58,20 +59,18 @@ def report(pot, po_dir):
     result = []
     for path in sorted(po_dir.glob("*.po")):
         translated = parse_po(path)
-        missing = [
-            key for key, entry in reference.items()
-            if key not in translated or not translated[key]["translated"]
-        ]
-        result.append({
-            "language": path.stem,
-            "total": len(reference),
-            "translated": len(reference) - len(missing),
-            "untranslated": len(missing),
-            "coverage_percent": round(100 * (len(reference) - len(missing)) / len(reference), 1)
-            if reference else 100.0,
-            "catalog_only": sum(key not in reference for key in translated),
-            "missing": [{"context": ctx, "msgid": msgid} for ctx, msgid in missing],
-        })
+        missing = [key for key, entry in reference.items() if key not in translated or not translated[key]["translated"]]
+        result.append(
+            {
+                "language": path.stem,
+                "total": len(reference),
+                "translated": len(reference) - len(missing),
+                "untranslated": len(missing),
+                "coverage_percent": round(100 * (len(reference) - len(missing)) / len(reference), 1) if reference else 100.0,
+                "catalog_only": sum(key not in reference for key in translated),
+                "missing": [{"context": ctx, "msgid": msgid} for ctx, msgid in missing],
+            }
+        )
     return result
 
 
@@ -99,8 +98,10 @@ def main():
     else:
         print(f"{'Language':<12} {'Translated':>10} {'Missing':>9} {'Coverage':>10} {'Outdated':>9}")
         for row in rows:
-            print(f"{row['language']:<12} {row['translated']:>10} {row['untranslated']:>9} "
-                  f"{row['coverage_percent']:>9.1f}% {row['catalog_only']:>9}")
+            print(
+                f"{row['language']:<12} {row['translated']:>10} {row['untranslated']:>9} "
+                f"{row['coverage_percent']:>9.1f}% {row['catalog_only']:>9}"
+            )
 
 
 if __name__ == "__main__":
