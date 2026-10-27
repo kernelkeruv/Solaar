@@ -6,7 +6,6 @@ import unittest
 
 from pathlib import Path
 
-
 COVERAGE_SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "po-coverage.py"
 UTILS = runpy.run_path(str(COVERAGE_SCRIPT))
 parse_po = UTILS["parse_po"]
