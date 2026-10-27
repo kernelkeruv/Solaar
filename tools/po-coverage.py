@@ -12,7 +12,6 @@ import re
 
 from pathlib import Path
 
-
 FIELD_RE = re.compile(r'^(msgctxt|msgid_plural|msgid|msgstr(?:\[\d+\])?)\s+(".*")$')
 
 
