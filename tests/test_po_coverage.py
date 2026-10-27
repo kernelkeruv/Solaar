@@ -3,6 +3,7 @@
 import runpy
 import tempfile
 import unittest
+
 from pathlib import Path
 
 
@@ -14,7 +15,7 @@ report = UTILS["report"]
 
 class TranslationCoverageTests(unittest.TestCase):
     def test_parsing_plural_fuzzy_multiline_context_and_obsolete_entries(self):
-        po_text = '''
+        po_text = """
 msgid ""
 msgstr "Language: ru\\n"
 
@@ -42,7 +43,7 @@ msgstr ""
 
 #~ msgid "Obsolete"
 #~ msgstr "Устарело"
-'''
+"""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "ru.po"
             path.write_text(po_text, encoding="utf-8")
@@ -66,8 +67,7 @@ msgstr ""
             )
             locale = folder / "ru.po"
             locale.write_text(
-                'msgid "Existing"\nmsgstr "Существующий"\n\n'
-                'msgid "Old"\nmsgstr "Старый"\n',
+                'msgid "Existing"\nmsgstr "Существующий"\n\n' 'msgid "Old"\nmsgstr "Старый"\n',
                 encoding="utf-8",
             )
             result = report(folder / "solaar.pot", folder)
